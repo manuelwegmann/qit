@@ -1,8 +1,44 @@
-# Install with:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Install torch and torchvision first (--no-deps to avoid resolver conflicts):
+#   pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 \
+#       --index-url https://download.pytorch.org/whl/cu128 --no-deps
+# Then install the rest:
 #   pip install -r requirements.txt
 
-numpy>=1.23
-tqdm>=4.64
-scikit-learn>=1.2
-matplotlib>=3.7
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+
+# Core
+numpy==2.4.6
+tqdm==4.67.3
+scikit-learn==1.8.0
+matplotlib==3.10.9
+scipy==1.17.1
+pillow==12.2.0
+
+# NVIDIA CUDA runtime wheels (required for torch to import on login node)
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cuda-cccl-cu12==12.9.27
+nvidia-cuda-cupti-cu12==12.9.79
+nvidia-cuda-nvrtc-cu12==12.9.86
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cudnn-cu12==9.22.0.52
+nvidia-cufft-cu12==11.4.1.4
+nvidia-cufile-cu12==1.14.1.1
+nvidia-curand-cu12==10.3.10.19
+nvidia-cusolver-cu12==11.7.5.82
+nvidia-cusparse-cu12==12.5.10.65
+nvidia-cusparselt-cu12==0.8.1
+nvidia-nccl-cu12==2.30.4
+nvidia-nvjitlink-cu12==12.9.86
+nvidia-nvshmem-cu12==3.6.5
+nvidia-nvtx-cu12==12.9.79
+
+# torch transitive deps (installed separately due to --no-deps above)
+filelock==3.29.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+sympy==1.14.0
+triton==3.7.0
+typing_extensions==4.15.0

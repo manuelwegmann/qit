@@ -19,7 +19,9 @@ Usage:
 
 import argparse
 import json
+import shutil
 import sys
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -74,9 +76,24 @@ class _IndexedSubset(torch.utils.data.Dataset):
         return x, y, self.subset.indices[idx]
 
 
-def _resnet18_backbone() -> nn.Module:
-    m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    m.fc = nn.Identity()
+def build_backbone(name: str) -> nn.Module:
+    if name == "resnet18":
+        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        m.fc = nn.Identity()
+    elif name == "efficientnet_b0":
+        m = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+        m.classifier = nn.Identity()
+    elif name == "mobilenet_v3_small":
+        m = models.mobilenet_v3_small(weights=models.MobileNetV3_Small_Weights.IMAGENET1K_V1)
+        m.classifier = nn.Identity()
+    elif name == "vit_b_16":
+        m = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        m.heads = nn.Identity()
+    elif name == "swin_t":
+        m = models.swin_t(weights=models.Swin_T_Weights.IMAGENET1K_V1)
+        m.head = nn.Identity()
+    else:
+        raise ValueError(f"Unknown backbone: {name!r}")
     return m
 
 
@@ -297,8 +314,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs",      type=int,   default=50)
     parser.add_argument("--patience",    type=int,   default=10,
-                        help="Early stopping: halt if val loss does not improve "
-                             "for this many epochs. 0 = disabled.")
+                        help="Early stopping: halt if moving-avg val loss does not "
+                             "improve for this many epochs. 0 = disabled.")
+    parser.add_argument("--val_window",  type=int,   default=3,
+                        help="Window size for moving-average val loss used in "
+                             "early stopping and best-checkpoint selection.")
     parser.add_argument("--lr",          type=float, default=1e-4)
     parser.add_argument("--lr_schedule", type=str,   default="cosine",
                         choices=["cosine", "constant"],
@@ -327,6 +347,9 @@ def main():
     parser.add_argument("--n_train",     type=int,   default=5000,
                         help="QIT training images to use. -1 = all.")
     parser.add_argument("--num_workers", type=int,   default=8)
+    parser.add_argument("--backbone",     type=str,   default="resnet18",
+                        choices=["resnet18", "efficientnet_b0",
+                                 "mobilenet_v3_small", "vit_b_16", "swin_t"])
     parser.add_argument("--dataset",     type=str,   default="stl10",
                         choices=["cifar10", "stl10"],
                         help="Dataset. stl10 uses the unlabeled split for QIT "
@@ -334,12 +357,13 @@ def main():
     parser.add_argument("--data_dir",    type=str,   default=None,
                         help="Dataset root dir. Defaults to data/<dataset>.")
     parser.add_argument("--no_amp",      action="store_true")
-    parser.add_argument("--output_dir",  type=str,   default="runs/qit_cifar")
+    parser.add_argument("--output_dir",  type=str,   default=None,
+                        help="Output dir. Defaults to runs/qit_<dataset>_<backbone>.")
     args = parser.parse_args()
 
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = not args.no_amp and device.type == "cuda"
-    out     = Path(args.output_dir)
+    out     = Path(args.output_dir or f"runs/qit_{args.dataset}_{args.backbone}")
     out.mkdir(parents=True, exist_ok=True)
 
     w_range = (args.w_bits_min, args.w_bits_max)
@@ -347,8 +371,9 @@ def main():
 
     data_dir = args.data_dir or f"data/{args.dataset}"
     print("=" * 70)
-    print(f"QIT validation — {args.dataset.upper()} / ResNet18")
+    print(f"QIT validation — {args.dataset.upper()} / {args.backbone}")
     print("=" * 70)
+    print(f"  backbone     : {args.backbone}")
     print(f"  dataset      : {args.dataset}")
     print(f"  n_train      : {args.n_train} (-1 = all)")
     print(f"  epochs       : {args.epochs}")
@@ -409,22 +434,29 @@ def main():
           f"Probe train: {len(probe_train_ds)} | Probe test: {len(probe_test_ds)}\n")
 
     # ── teacher ───────────────────────────────────────────────────────────
-    print("Loading teacher (ImageNet-pretrained ResNet18)...")
-    teacher = _resnet18_backbone().to(device)
+    print(f"Loading teacher (ImageNet-pretrained {args.backbone})...")
+    teacher = build_backbone(args.backbone).to(device)
     for p in teacher.parameters():
         p.requires_grad_(False)
     teacher.eval()
 
     # ── student ───────────────────────────────────────────────────────────
-    print("Loading student (same ImageNet-pretrained weights)...")
-    student = _resnet18_backbone().to(device)
+    print(f"Loading student (same ImageNet-pretrained weights)...")
+    student = build_backbone(args.backbone).to(device)
 
     results        = {"epochs": [], "probe": {}}
     best_ckpt_path = out / "checkpoint_best.pt"
 
     if args.epochs > 0:
-        print("Caching teacher training features...")
-        teacher_feats_cache = cache_teacher_features(teacher, cache_loader, device, use_amp)
+        feat_cache_path = Path(data_dir) / f"teacher_feats_{args.backbone}.pt"
+        if feat_cache_path.exists():
+            print(f"Loading cached teacher features from {feat_cache_path}...")
+            teacher_feats_cache = torch.load(feat_cache_path, map_location="cpu")
+        else:
+            print("Computing teacher features (first run for this backbone)...")
+            teacher_feats_cache = cache_teacher_features(teacher, cache_loader, device, use_amp)
+            torch.save(teacher_feats_cache, feat_cache_path)
+            print(f"  Saved to {feat_cache_path}")
         print(f"  Cache shape: {teacher_feats_cache.shape}\n")
 
         bit_sampler = BitWidthSampler(w_range, a_range, mode=args.bit_sampling)
@@ -439,7 +471,10 @@ def main():
         teacher_params = (list(teacher.named_parameters())
                           if args.reg_weight > 0.0 else None)
 
-        best_val_loss     = float("inf")
+        val_history       = deque(maxlen=args.val_window)
+        ckpt_buffer       = deque(maxlen=args.val_window)  # (epoch, buf_slot)
+        best_avg_val      = float("inf")
+        best_mid_epoch    = -1
         epochs_no_improve = 0
     else:
         print("[epochs=0] Skipping QIT training — BN recalibration control.\n")
@@ -463,14 +498,18 @@ def main():
             weight_granularity=args.weight_granularity,
         )
 
-        is_best = val_loss < best_val_loss
+        val_history.append(val_loss)
+        avg_val  = sum(val_history) / len(val_history)
+        window_full = len(val_history) == args.val_window
+        is_best  = window_full and avg_val < best_avg_val
         if is_best:
-            best_val_loss     = val_loss
+            best_avg_val      = avg_val
             epochs_no_improve = 0
-        else:
+        elif window_full:
             epochs_no_improve += 1
 
-        marker = " *best*" if is_best else ""
+        marker = f" *best* (avg={avg_val:.4f})" if is_best else (
+                 f" (avg={avg_val:.4f})" if window_full else "")
         print(f"[epoch {epoch:3d}/{args.epochs}]  "
               f"loss={loss:.4f}  fp_sim={fp_sim:.4f}  |  "
               f"val_loss={val_loss:.4f}  val_fp_sim={val_fp_sim:.4f}{marker}")
@@ -479,49 +518,63 @@ def main():
             "val_loss": val_loss, "val_fp_sim": val_fp_sim,
         })
 
+        slot = (epoch - 1) % args.val_window
         ckpt = {"epoch": epoch, "student": student.state_dict()}
+        torch.save(ckpt, out / f"_buf{slot}.pt")
         torch.save(ckpt, out / "checkpoint_latest.pt")
+        ckpt_buffer.append((epoch, slot))
         if is_best:
-            torch.save(ckpt, best_ckpt_path)
+            mid_epoch, mid_slot = list(ckpt_buffer)[args.val_window // 2]
+            shutil.copy(out / f"_buf{mid_slot}.pt", best_ckpt_path)
+            best_mid_epoch = mid_epoch
 
         if scheduler is not None:
             scheduler.step()
 
-        if args.patience > 0 and epochs_no_improve >= args.patience:
-            print(f"\n[early stop] val loss did not improve for "
-                  f"{args.patience} epochs. Best: {best_val_loss:.4f}")
+        if args.patience > 0 and window_full and epochs_no_improve >= args.patience:
+            print(f"\n[early stop] {args.val_window}-epoch avg val loss did not improve "
+                  f"for {args.patience} epochs. Best avg: {best_avg_val:.4f}")
             break
 
     if epoch > 0:
         torch.save({"epoch": epoch, "student": student.state_dict()},
                    out / "checkpoint_final.pt")
+        for i in range(args.val_window):
+            p = out / f"_buf{i}.pt"
+            if p.exists():
+                p.unlink()
 
     # Load best checkpoint for probe evaluation (skip if epochs=0)
     if best_ckpt_path.exists():
-        print(f"\nLoading best checkpoint (val_loss={best_val_loss:.4f}) "
-              f"for evaluation...")
+        print(f"\nLoading best checkpoint (epoch {best_mid_epoch}, "
+              f"window avg={best_avg_val:.4f}) for evaluation...")
         student.load_state_dict(torch.load(best_ckpt_path, map_location=device)["student"])
     else:
         print("\n[epochs=0] Using initial student weights (= teacher) for evaluation.")
 
-    # ── BN recalibration (student only) ──────────────────────────────────
+    # ── BN recalibration (student only, CNN backbones) ───────────────────
     # QIT mixes quantized and FP forward passes, miscalibrating BatchNorm
     # running stats. Reset them with a FP pass over the QIT training data.
+    # ViT/Swin use LayerNorm (no running stats) so recalibration is skipped.
     # The teacher is NOT recalibrated — its ImageNet BN stats are already
     # correct for its learned features, and recalibrating on a different
     # domain degrades feature quality.
-    print("Recalibrating student BN stats...")
-    student.train()
-    with torch.no_grad():
-        for batch in _pbar(cache_loader, desc="  student BN recal", leave=False):
-            x = batch[0].to(device)
-            if use_amp:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    has_bn = any(isinstance(m, nn.BatchNorm2d) for m in student.modules())
+    if has_bn:
+        print("Recalibrating student BN stats...")
+        student.train()
+        with torch.no_grad():
+            for batch in _pbar(cache_loader, desc="  student BN recal", leave=False):
+                x = batch[0].to(device)
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        student(x)
+                else:
                     student(x)
-            else:
-                student(x)
-    student.eval()
-    print("  Done.\n")
+        student.eval()
+        print("  Done.\n")
+    else:
+        print("Skipping BN recalibration (no BatchNorm layers).\n")
 
     # ── probe ─────────────────────────────────────────────────────────────
     print(f"\n{'Probe evaluation':=^70}")
@@ -552,7 +605,9 @@ def main():
     out_path = out / "results.json"
     with open(out_path, "w") as f:
         json.dump({
+            "backbone": args.backbone,
             "epochs": args.epochs, "patience": args.patience,
+            "val_window": args.val_window,
             "lr": args.lr, "lr_schedule": args.lr_schedule,
             "batch_size": args.batch_size, "loss": args.loss,
             "weight_granularity": args.weight_granularity,
