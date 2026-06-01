@@ -1,0 +1,39 @@
+GPU: NVIDIA A100-PCIE-40GB  (40960 MB)
+=== qit_merlin  job=6744  node=hendrixgpu08fl.unicph.domain ===
+data_dir=/home/nlr950/Dir/qit/../CT-CLIP/data/merlin_data
+epochs=40  batch_size=8  grad_accum=1  lr=1e-5  amp=fp16
+w_bits=2-8  a_bits=4-8
+output=runs/qit_merlin_40ep
+Mon Jun  1 11:59:09 CEST 2026
+Python 3.11.13
+torch 2.10.0+cu128 | cuda True
+======================================================================
+QIT — Merlin CT  W2-8 A4-8
+  data_dir  : /home/nlr950/Dir/qit/../CT-CLIP/data/merlin_data
+  epochs    : 40  lr=1e-05  bs=8  grad_accum=1
+  val_every : 1  val_bits=W8A8
+  amp       : True (fp16)
+  output    : runs/qit_merlin_40ep
+======================================================================
+
+Indexing dataset...
+indexing scans:   0%|          | 0/5097 [00:00<?, ?it/s]indexing scans: 100%|██████████| 5097/5097 [00:00<00:00, 301613.54it/s]
+indexing scans:   0%|          | 0/5097 [00:00<?, ?it/s]indexing scans: 100%|██████████| 5097/5097 [00:00<00:00, 310290.10it/s]
+indexing scans:   0%|          | 0/5097 [00:00<?, ?it/s]indexing scans: 100%|██████████| 5097/5097 [00:00<00:00, 305008.74it/s]
+/home/nlr950/Dir/qit/venv/lib64/python3.11/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/nlr950/Dir/qit/venv/lib64/python3.11/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=ResNet152_Weights.IMAGENET1K_V1`. You can also use `weights=ResNet152_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+  train=2000  val=500  test=757
+  conditions (3): atelectasis, pleural_effusion, renal_cyst
+
+Loading Merlin models (teacher + student)...
+  encoder params: 121,882,204
+  gradient checkpointing: always-on (built into I3ResNet)
+
+Caching teacher features for training set...
+caching teacher features:   0%|          | 0/250 [00:00<?, ?it/s]caching teacher features:   0%|          | 0/250 [00:12<?, ?it/s]/home/nlr950/Dir/qit/venv/lib64/python3.11/site-packages/torch/_dynamo/eval_frame.py:1181: UserWarning: torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly. Starting in PyTorch 2.9, calling checkpoint without use_reentrant will raise an exception. use_reentrant=False is recommended, but if you need to preserve the current default behavior, you can pass use_reentrant=True. Refer to docs for more details on the differences between the two variants.
+  return fn(*args, **kwargs)
+/home/nlr950/Dir/qit/venv/lib64/python3.11/site-packages/torch/utils/checkpoint.py:232: UserWarning: None of the inputs have requires_grad=True. Gradients will be None
+  check_backward_validity(args)
+caching teacher features:   0%|          | 1/250 [01:05<4:31:27, 65.41s/it]caching teacher features:   1%|          | 2/250 [01:07<1:55:12, 27.87s/it]caching teacher features:   1%|          | 3/250 [01:08<1:05:21, 15.88s/it]caching teacher features:   2%|▏         | 4/250 [01:11<43:49, 10.69s/it]  caching teacher features:   2%|▏         | 5/250 [01:12<30:15,  7.41s/it]caching teacher features:   2%|▏         | 6/250 [01:17<26:01,  6.40s/it]caching teacher features:   3%|▎         | 7/250 [01:18<19:33,  4.83s/it]caching teacher features:   3%|▎         | 8/250 [01:20<15:20,  3.80s/it]caching teacher features:   4%|▎         | 9/250 [02:24<1:30:15, 22.47s/it]caching teacher features:   4%|▍         | 10/250 [02:25<1:04:28, 16.12s/it]caching teacher features:   4%|▍         | 11/250 [02:28<47:37, 11.96s/it]  caching teacher features:   5%|▍         | 12/250 [02:30<35:25,  8.93s/it]caching teacher features:   5%|▌         | 13/250 [02:32<26:30,  6.71s/it]caching teacher features:   6%|▌         | 14/250 [02:33<20:20,  5.17s/it]caching teacher features:   6%|▌         | 15/250 [02:35<16:02,  4.10s/it]caching teacher features:   6%|▋         | 16/250 [02:36<13:03,  3.35s/it]caching teacher features:   7%|▋         | 17/250 [03:33<1:15:20, 19.40s/it]caching teacher features:   7%|▋         | 18/250 [03:35<54:20, 14.05s/it]  caching teacher features:   8%|▊         | 19/250 [03:36<39:41, 10.31s/it]caching teacher features:   8%|▊         | 20/250 [03:38<29:29,  7.70s/it]caching teacher features:   8%|▊         | 21/250 [03:40<22:23,  5.87s/it]caching teacher features:   9%|▉         | 22/250 [03:41<17:25,  4.59s/it]caching teacher features:   9%|▉         | 23/250 [03:43<13:58,  3.69s/it]caching teacher features:  10%|▉         | 24/250 [03:44<11:32,  3.07s/it]caching teacher features:  10%|█         | 25/250 [04:42<1:13:17, 19.54s/it]caching teacher features:  10%|█         | 26/250 [04:44<52:51, 14.16s/it]  caching teacher features:  11%|█         | 27/250 [04:46<38:36, 10.39s/it]caching teacher features:  11%|█         | 28/250 [04:47<28:40,  7.75s/it]caching teacher features:  12%|█▏        | 29/250 [04:49<21:44,  5.90s/it]caching teacher features:  12%|█▏        | 30/250 [04:50<16:54,  4.61s/it]caching teacher features:  12%|█▏        | 31/250 [04:52<13:32,  3.71s/it]caching teacher features:  13%|█▎        | 32/250 [04:54<11:10,  3.08s/it]caching teacher features:  13%|█▎        | 33/250 [05:50<1:08:35, 18.97s/it]caching teacher features:  14%|█▎        | 34/250 [05:51<49:31, 13.76s/it]  caching teacher features:  14%|█▍        | 35/250 [05:53<36:13, 10.11s/it]caching teacher features:  14%|█▍        | 36/250 [05:54<26:57,  7.56s/it]caching teacher features:  15%|█▍        | 37/250 [05:56<20:29,  5.77s/it]caching teacher features:  15%|█▌        | 38/250 [05:58<15:58,  4.52s/it]caching teacher features:  16%|█▌        | 39/250 [05:59<12:48,  3.64s/it]caching teacher features:  16%|█▌        | 40/250 [06:01<10:36,  3.03s/it]caching teacher features:  16%|█▋        | 41/250 [06:56<1:05:27, 18.79s/it]caching teacher features:  17%|█▋        | 42/250 [06:58<47:15, 13.63s/it]  caching teacher features:  17%|█▋        | 43/250 [07:00<34:34, 10.02s/it]caching teacher features:  18%|█▊        | 44/250 [07:02<26:06,  7.60s/it]caching teacher features:  18%|█▊        | 45/250 [07:03<19:49,  5.80s/it]caching teacher features:  18%|█▊        | 46/250 [07:05<15:26,  4.54s/it]caching teacher features:  19%|█▉        | 47/250 [07:06<12:22,  3.66s/it]caching teacher features:  19%|█▉        | 48/250 [07:08<10:14,  3.04s/it]

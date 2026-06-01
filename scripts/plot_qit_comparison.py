@@ -112,17 +112,25 @@ def main():
     ax.legend(handles=[teacher_patch, student_patch], fontsize=10,
               loc="lower left")
 
-    # Dataset / model info if available in results
-    dataset = data.get("dataset", "")
-    title_parts = ["QIT: teacher vs student across quantization regimes"]
-    if dataset:
-        title_parts.append(f"({dataset.upper()} / ResNet18)")
-    ax.set_title("  ".join(title_parts), fontsize=12, pad=12)
+    dataset  = data.get("dataset", "")
+    backbone = data.get("backbone") or data.get("model", "")
+    subtitle = f"{dataset.upper()} / {backbone}" if dataset or backbone else ""
+    title    = "QIT: teacher vs student across quantization regimes"
+    if subtitle:
+        title = f"{title}\n{subtitle}"
+    ax.set_title(title, fontsize=12, pad=12)
 
     plt.tight_layout()
 
-    out_path = (Path(args.out) if args.out
-                else results_path.parent / "qit_comparison.png")
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        stem = "qit_comparison"
+        if dataset:
+            stem += f"_{dataset}"
+        if backbone:
+            stem += f"_{backbone.replace('/', '_')}"
+        out_path = results_path.parent / f"{stem}.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Figure saved → {out_path}")

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=qft_qit_cifar
+#SBATCH --job-name=qit
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.out
 #SBATCH --gres=gpu:a100:1

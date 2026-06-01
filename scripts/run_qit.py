@@ -28,37 +28,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tqdm
-from torch.utils.data import DataLoader, Subset, TensorDataset
-from torchvision import datasets, models, transforms
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from models.quantization import quantized_forward, BitWidthSampler
-
-
-def _pbar(iterable, **kwargs):
-    """tqdm wrapper that updates every ~5% — keeps Slurm logs readable."""
-    n = len(iterable) if hasattr(iterable, "__len__") else None
-    extra = {"miniters": max(1, n // 20), "mininterval": 0} if n else {"mininterval": 30}
-    return tqdm.tqdm(iterable, **extra, **kwargs)
-
-QUANT_CONFIGS = [
-    ("fp",   None, None),
-    ("w8a8", 8,    8),
-    ("w6a6", 6,    6),
-    ("w4a6", 4,    6),
-    ("w4a4", 4,    4),
-    ("w2a4", 2,    4),
-]
-
-_TRANSFORM = transforms.Compose([
-    transforms.Resize(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+from models.eval_utils import (
+    _pbar, QUANT_CONFIGS, _TRANSFORM, build_backbone,
+    extract_features, run_probe,
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -74,27 +54,6 @@ class _IndexedSubset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         x, y = self.subset[idx]
         return x, y, self.subset.indices[idx]
-
-
-def build_backbone(name: str) -> nn.Module:
-    if name == "resnet18":
-        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        m.fc = nn.Identity()
-    elif name == "efficientnet_b0":
-        m = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-        m.classifier = nn.Identity()
-    elif name == "mobilenet_v3_small":
-        m = models.mobilenet_v3_small(weights=models.MobileNetV3_Small_Weights.IMAGENET1K_V1)
-        m.classifier = nn.Identity()
-    elif name == "vit_b_16":
-        m = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-        m.heads = nn.Identity()
-    elif name == "swin_t":
-        m = models.swin_t(weights=models.Swin_T_Weights.IMAGENET1K_V1)
-        m.head = nn.Identity()
-    else:
-        raise ValueError(f"Unknown backbone: {name!r}")
-    return m
 
 
 def compute_qit_loss(z_student: torch.Tensor, z_teacher: torch.Tensor,
@@ -125,93 +84,6 @@ def cache_teacher_features(teacher, loader, device, use_amp) -> torch.Tensor:
         else:
             feats.append(teacher(x).cpu())
     return torch.cat(feats)  # [N, 512]
-
-
-@torch.no_grad()
-def extract_features(backbone, loader, device, use_amp,
-                     w_bits=None, a_bits=None, weight_granularity="per_tensor"):
-    backbone.eval()
-    feats, labels = [], []
-    for batch in _pbar(loader, desc="    extracting", leave=False):
-        x, y = batch[0].to(device), batch[1]
-        if use_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                f = (backbone(x) if w_bits is None else
-                     _q_forward(backbone, x, w_bits, a_bits, weight_granularity))
-        else:
-            f = (backbone(x) if w_bits is None else
-                 _q_forward(backbone, x, w_bits, a_bits))
-        feats.append(f.cpu().float())
-        labels.append(y)
-    return torch.cat(feats).numpy(), torch.cat(labels).numpy()
-
-
-def _q_forward(backbone, x, w_bits, a_bits, weight_granularity="per_tensor"):
-    with quantized_forward([backbone], w_bits, a_bits, weight_granularity):
-        return backbone(x)
-
-
-# ── probe ─────────────────────────────────────────────────────────────────────
-
-def run_probe(train_feats, train_labels, test_feats, test_labels,
-              device, epochs=500, lr=1e-3, batch_size=256,
-              n_seeds=3, es_patience=30, es_tol=1e-5) -> float:
-    """Linear probe: nn.Linear + Adam + cosine LR decay, averaged over n_seeds.
-
-    Each seed uses a fixed random initialisation for reproducibility. Early
-    stopping on training loss plateau prevents wasted epochs on converged probes.
-    Final accuracy is the mean over all seeds.
-    """
-    X_tr = torch.tensor(train_feats, dtype=torch.float32)
-    y_tr = torch.tensor(train_labels, dtype=torch.long)
-    X_te = torch.tensor(test_feats,  dtype=torch.float32)
-    y_te = torch.tensor(test_labels, dtype=torch.long)
-
-    mu   = X_tr.mean(0)
-    std  = X_tr.std(0).clamp(min=1e-8)
-    X_tr = (X_tr - mu) / std
-    X_te = (X_te - mu) / std
-
-    n_classes = int(y_tr.max().item()) + 1
-    dataset   = TensorDataset(X_tr.to(device), y_tr.to(device))
-    loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    accs = []
-    for seed in range(n_seeds):
-        torch.manual_seed(seed)
-        head = nn.Linear(X_tr.shape[1], n_classes).to(device)
-        opt  = torch.optim.Adam(head.parameters(), lr=lr)
-        sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=0)
-
-        best_loss   = float("inf")
-        no_improve  = 0
-
-        head.train()
-        for _ in range(epochs):
-            epoch_loss = 0.0
-            for xb, yb in loader:
-                opt.zero_grad()
-                loss = F.cross_entropy(head(xb), yb)
-                loss.backward()
-                opt.step()
-                epoch_loss += loss.item()
-            sch.step()
-
-            epoch_loss /= len(loader)
-            if best_loss - epoch_loss > es_tol:
-                best_loss  = epoch_loss
-                no_improve = 0
-            else:
-                no_improve += 1
-            if no_improve >= es_patience:
-                break
-
-        head.eval()
-        with torch.no_grad():
-            preds = head(X_te.to(device)).argmax(1).cpu()
-        accs.append((preds == y_te).float().mean().item())
-
-    return float(np.mean(accs))
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -402,11 +274,10 @@ def main():
         full_train = qit_full   # teacher feature cache indexes into this
     else:
         print("Loading CIFAR-10...")
-        full_train     = datasets.CIFAR10(data_dir, train=True,  download=True,
-                                          transform=_TRANSFORM)
-        probe_train_ds = full_train
-        probe_test_ds  = datasets.CIFAR10(data_dir, train=False, download=True,
-                                          transform=_TRANSFORM)
+        full_train    = datasets.CIFAR10(data_dir, train=True,  download=True,
+                                         transform=_TRANSFORM)
+        probe_test_ds = datasets.CIFAR10(data_dir, train=False, download=True,
+                                         transform=_TRANSFORM)
 
     # QIT train/val split within the QIT dataset
     rng      = np.random.default_rng(42)
@@ -414,6 +285,10 @@ def main():
     n_subset = len(full_train) if args.n_train < 0 else min(args.n_train, len(full_train))
     subset   = all_idx[:n_subset]
     n_train  = int(0.9 * n_subset)
+
+    # CIFAR-10: probe trains on the held-out portion not used for QIT
+    if args.dataset == "cifar10":
+        probe_train_ds = Subset(full_train, all_idx[n_subset:])
     train_ds = _IndexedSubset(Subset(full_train, subset[:n_train]))
     val_ds   = _IndexedSubset(Subset(full_train, subset[n_train:]))
 

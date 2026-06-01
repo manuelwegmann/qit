@@ -33,6 +33,23 @@ nvidia-nvjitlink-cu12==12.9.86
 nvidia-nvshmem-cu12==3.6.5
 nvidia-nvtx-cu12==12.9.79
 
+# Text / HuggingFace
+transformers==5.9.0
+datasets==4.8.5
+tokenizers==0.22.2
+huggingface_hub==1.16.4
+safetensors==0.7.0
+pyarrow==24.0.0
+multiprocess==0.70.19
+dill==0.4.1
+xxhash==3.7.0
+fsspec==2026.2.0
+aiohttp==3.13.5
+merlin-vlm==0.0.7
+openpyxl==3.1.5
+regex==2026.5.9
+requests==2.34.2
+
 # torch transitive deps (installed separately due to --no-deps above)
 filelock==3.29.0
 Jinja2==3.1.6
