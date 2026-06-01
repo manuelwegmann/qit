@@ -7,3 +7,4 @@ __pycache__/
 *.pt
 .DS_Store
 cluster_info.md
+*.out
