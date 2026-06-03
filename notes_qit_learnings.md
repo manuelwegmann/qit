@@ -1,160 +1,116 @@
 # QIT Learnings
 
-Quantization Invariance Training (QIT): fine-tune a student backbone (same weights as
-teacher) to produce similar feature representations under random fake-quantization, so
-that the model degrades less when deployed at lower bit-widths.
+Quantization Invariance Training (QIT): fine-tune a student backbone (same init as teacher)
+so that its features under random fake-quantization match the frozen teacher's full-precision
+features. At deployment, the student is more robust to low bit-widths without full retraining.
 
 ---
 
-## CT-CLIP experiments
+## Evaluation setup
 
-All CT-CLIP runs use the pre-VQ features (512-dim) from the frozen teacher.
-Teacher features for all 5097 scans are cached at `runs/feature_cache_full/pretrained_pre_vq/`.
-Evaluation: macro-mean AUROC across 6 conditions, linear probe, N=all.
+Five ImageNet-pretrained backbones on CIFAR-10 and STL-10:
+ResNet18, EfficientNet-B0, MobileNetV3-Small, ViT-B/16, Swin-T.
 
-### Baseline (PTQ, no QIT)
-| Config | AUROC |
-|--------|-------|
-| FP     | 0.657 |
-| W8A8   | 0.653 |
-| W4A4   | 0.531 |
+After QIT, a **linear probe** is trained on student features at FP, W8A8, W6A6, W4A6, W4A4,
+and W2A4 and compared against the same probe on teacher features. Accuracy = top-1.
 
-### `runs/qit_test` — cosine loss, per-tensor, 10 epochs, 500 scans
-3 quantizations per step (original setup). **First positive signal.**
+CNN backbones (ResNet18, EfficientNet, MobileNet) receive a BN recalibration pass (FP,
+student weights) before probing. ViT and Swin use LayerNorm — no recal needed.
 
-| Config | Teacher | Student | Δ | feat_sim |
-|--------|---------|---------|---|---------|
-| FP     | 0.657   | 0.646   | −0.011 | 0.982 |
-| W8A8   | 0.653   | 0.646   | −0.007 | 0.844 |
-| W4A4   | 0.547   | **0.566** | **+0.019** | 0.205 |
-
-W4A4 improves over naive PTQ (+3.5pp). FP features well-preserved (feat_sim=0.982).
-Val_loss plateau after epoch 6; no meaningful further improvement with more epochs.
-
-### `runs/qit_mse` — MSE loss, single quantization/step, 10 epochs, 500 scans
-### `runs/qit_kl` — KL loss, single quantization/step, 10 epochs, 500 scans (partial)
-
-Both significantly worse than cosine:
-
-| Config | Teacher | MSE student | KL student |
-|--------|---------|-------------|------------|
-| FP     | 0.657   | 0.537 (−0.120) | 0.537 (−0.120) |
-| W8A8   | 0.653   | 0.526 (−0.127) | — |
-| W4A4   | 0.547   | 0.508 (−0.039) | — |
-
-**Why:** MSE and KL penalise feature magnitude as well as direction. The optimizer
-reduces loss by shrinking feature vectors, destroying the class-discriminative structure.
-Cosine loss only penalises angular deviation, leaving magnitude structure intact.
-
-**Lesson: use cosine loss.**
-
-### `runs/qit_cosine_pc` — cosine, per-channel, 5 epochs, 1000 scans
-Failed with `RuntimeError: GET was unable to find an engine` (CTViT PEG Conv3d).
-Root cause: job landed on `hendrixgpu12fl` (Quadro RTX 6000, 24 GB).
-Per-channel quantization requires more cuDNN workspace; just enough memory to
-trigger a failure that per-tensor quantization avoided.
-Fix: added 12fl to node exclusion list.
+Teacher features are cached to disk once per backbone so training never re-runs the teacher.
 
 ---
 
-## CIFAR-10 / ResNet18 experiments
+## Results
 
-Used for rapid iteration on training pipeline design. All runs use
-`scripts/run_qit_cifar.py` with `--weight_granularity per_channel`.
+### Transformers — very large gains
 
-**Important caveat:** ResNet18 is already highly quantization-robust (W4A4 only −17.7pp),
-so absolute improvements are small. Results are better interpreted as relative comparisons
-than evidence of method effectiveness.
+ViT-B/16 and Swin-T are highly quantization-sensitive without QIT; the student recovers
+near-FP accuracy down to W4A4:
 
-### `runs/qit_cifar` — bs=256, no early stopping, sklearn probe (broken — sklearn API issue)
-
-### `runs/qit_cifar_pc` — bs=16, cosine decay, PyTorch linear probe, student BN recal only
-
-| Config | Teacher | Student | Δ | feat_sim |
-|--------|---------|---------|---|---------|
-| FP     | 0.869   | 0.854   | −0.015 | 0.891 |
-| W8A8   | 0.868   | 0.846   | −0.022 | 0.892 |
-| W4A4   | 0.692   | **0.775** | **+0.083** | 0.647 |
-| W2A4   | 0.225   | 0.230   | +0.005 | 0.819 |
-
-Best result for CIFAR-10. **But caveat:** early stopping selected epoch 1 (barely
-trained); the gain may partly reflect BN recalibration adapting ImageNet BN stats
-to CIFAR-10 rather than QIT learning quantization robustness.
-
-### `runs/qit_cifar_pc_v2` — same + teacher BN recalibration added, 50 epochs
-
+**STL-10 / ViT-B/16** (teacher FP = 0.985)
 | Config | Teacher | Student | Δ |
 |--------|---------|---------|---|
-| FP     | 0.805   | 0.753   | −0.052 |
-| W4A4   | 0.542   | 0.516   | −0.026 |
+| FP     | 0.985   | 0.981   | −0.005 |
+| W8A8   | 0.984   | 0.981   | −0.004 |
+| W6A6   | 0.928   | 0.981   | +0.053 |
+| W4A6   | 0.704   | 0.980   | +0.276 |
+| W4A4   | 0.261   | **0.967** | **+0.707** |
+| W2A4   | 0.186   | 0.244   | +0.058 |
 
-Much worse. Teacher BN recalibration on CIFAR-10 *hurt* the teacher (0.869→0.805)
-because its ImageNet-trained BN stats were already appropriate for its learned features.
-**Lesson: recalibrate student BN only, not teacher.**
+**STL-10 / Swin-T** (teacher FP = 0.983)
+| Config | Teacher | Student | Δ |
+|--------|---------|---------|---|
+| W4A4   | 0.846   | **0.971** | **+0.124** |
+| W2A4   | 0.302   | **0.951** | **+0.650** |
+
+**CIFAR-10 / ViT-B/16**: W4A4 +62.9pp (0.305 → 0.934), W4A6 +29.3pp.
+**CIFAR-10 / Swin-T**: W2A4 +56.5pp (0.335 → 0.900), W4A4 +19.0pp.
+
+### CNNs — mixed
+
+**MobileNetV3-Small** benefits substantially (architecture is quantization-sensitive):
+- STL-10 W6A6: +61.8pp (0.202 → 0.819); W8A8: +22.7pp
+- CIFAR-10 W6A6: +33.4pp; W8A8: +18.4pp
+
+**EfficientNet-B0**: modest gains (W8A8 ~+2–4pp; W6A6 ~+18pp on STL-10).
+
+**ResNet18**: already robust on STL-10 (W4A4 +8.0pp). On CIFAR-10 student
+is worse than teacher FP across all configs — failure case, possibly BN instability.
+
+### PTQ calibration comparison — ViT-B/16 STL-10
+
+QIT student vs. teacher with best per-tensor/percentile PTQ calibration:
+
+| Config | Teacher (best PTQ) | QIT student |
+|--------|--------------------|-------------|
+| FP     | 0.986              | 0.981       |
+| W8A8   | 0.986              | 0.981       |
+| W6A6   | 0.969              | **0.981**   |
+| W4A6   | 0.829              | **0.980**   |
+| W4A4   | 0.576              | **0.977**   |
+| W2A4   | 0.237              | 0.329       |
+
+QIT accuracy is essentially flat from FP through W4A4; teacher accuracy collapses.
+
+### QAT warm-start — QIT init vs. pretrained init
+
+QIT provides a better starting point for quantization-aware training:
+
+| Model + config          | Pretrained init | QIT init | Δ |
+|-------------------------|-----------------|----------|---|
+| ViT-B/16 STL-10 W4A4   | 0.608           | **0.951** | +34.3pp |
+| MobileNet CIFAR-10 W8A8 | 0.888           | 0.931    | +4.3pp |
+
+### Text (DistilBERT / SST-2) — failed
+
+Student degraded at all configs (FP: 0.820 → 0.611; W8A8: 0.824 → 0.529).
+NLP models appear to have different quantization dynamics; training config not tuned for text.
+
+### Merlin CT — not completed
+
+Runs crashed with CUDA OOM when caching teacher features for 250 training scans
+on a 40 GB A100 (needed ~13 GB extra, only ~8 GB free). Full Merlin evaluation pending.
 
 ---
 
 ## Key lessons
 
-### Loss function
-- **Cosine is the only viable option** tested so far. MSE and KL destroy FP features.
-- Combined loss `α·L_QIT + β·L_FP` (QIT on quantized path + cosine preservation on
-  FP path) is theoretically sound as a way to prevent FP drift but needs `β` small
-  (~0.1). At β=0.5 the FP term dominates and fights the QIT objective.
+**Loss:** cosine is essential. MSE/KL penalise feature magnitude as well as direction —
+the optimizer collapses features. Cosine penalises angular deviation only.
 
-### Quantization granularity
-- **Per-tensor** (one scale per tensor): coarser, safer, no cuDNN issues.
-- **Per-channel** (one scale per output channel): closer to real deployment, but caused
-  cuDNN workspace failures on 24 GB GPU node. Should work on A100 with 12fl excluded.
-- CT-CLIP Linear weights have near-uniform distribution (kurtosis ≈ −1.2); no dramatic
-  outlier channels. The difference between per-tensor and per-channel may be less
-  impactful here than for transformer models with known outlier channels.
+**Architecture matters most:** transformers (ViT, Swin) degrade severely under PTQ because
+of outlier activations; QIT eliminates that sensitivity almost entirely. CNNs vary —
+MobileNet benefits strongly, ResNet18 less so (already robust).
 
-### Training setup
-- **Single quantization per step**: cleaner gradient signal than averaging N quantizations.
-- **Teacher feature cache** (`runs/feature_cache_full/pretrained_pre_vq/feats.pt`):
-  eliminates teacher forward pass during training — major speedup.
-- **LR cosine annealing**: smoother convergence, especially in later epochs.
-- **Weight regularisation toward teacher** (`reg_weight`): prevents weight range from
-  growing monotonically (observed in all runs). Weight range increase = larger
-  quantization step size = worse W4A4 performance. Start with `reg_weight=1e-5`.
-- **Batch size**: smaller = more diverse quantization configs per epoch. For CT-CLIP
-  batch_size=2 is the memory limit.
+**QIT as QAT warm-start:** even a partial reduction in quantization sensitivity translates
+to a large QAT accuracy jump, especially for transformers.
 
-### Evaluation / BN
-- **CT-CLIP uses LayerNorm** throughout — BN recalibration is irrelevant for CT-CLIP.
-  Student features are clean at eval time without any extra steps.
-- **CIFAR-10 / ResNet18**: student BN stats are corrupted by mixed quantized/FP training
-  passes. One FP recalibration pass is essential before probe evaluation.
-- **Do not recalibrate teacher BN**: ImageNet-trained stats are already correct for the
-  teacher's features.
+**W2A4 ceiling:** even the best-case student does not recover at W2A4 (gains are small or
+negative). W4A4 appears to be the practical floor for QIT.
 
-### Early stopping
-- Val_loss is noisy (single random bit-width per validation batch).
-- Rolling 3-epoch mean + middle-of-window checkpoint selection reduces noise.
-- Criterion: smoothed val_loss (lower = better quantization robustness), patience=5.
+**BN recalibration:** always recalibrate student BN, never teacher BN. Teacher's
+ImageNet-trained stats are already correct for its own features.
 
-### Why CIFAR-10 is a weak testbed
-- ResNet18 W4A4 only degrades 17.7pp — small room for improvement.
-- CT-CLIP W4A4 degrades ~12pp on a harder task with more complex weight structure —
-  more meaningful signal for QIT to improve.
-
----
-
-## Recommended CT-CLIP setup (not yet run)
-
-```bash
-N_SCANS=1000  EPOCHS=15  LOSS=cosine  \
-WEIGHT_GRAN=per_channel  \
-FP_LOSS_WEIGHT=0.1  REG_WEIGHT=1e-5  \
-OUTPUT_DIR=runs/qit_proper  \
-sbatch scripts/run_qit_slurm.sbatch
-```
-
-Missing from `run_qit.py` (ported to CIFAR script only, needs backport):
-- `--fp_loss_weight`
-- `--reg_weight`
-- `--lr_schedule` (cosine annealing)
-- Early stopping (`--patience`, `--es_window`)
-
-These should be ported from `scripts/run_qit_cifar.py` before running.
+**Feature caching:** cache teacher features before training. Avoids a full teacher forward
+pass every step and enables large batch sizes without memory pressure.

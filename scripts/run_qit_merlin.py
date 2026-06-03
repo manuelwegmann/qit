@@ -63,7 +63,7 @@ _EVAL_CONFIGS = [
 
 
 # ---------------------------------------------------------------------------
-# Indexed dataset wrapper
+# Dataset wrappers
 # ---------------------------------------------------------------------------
 
 class _IndexedDataset(torch.utils.data.Dataset):
@@ -75,6 +75,36 @@ class _IndexedDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         x, y = self._ds[i]
         return i, x, y
+
+
+class _ResizedDataset(torch.utils.data.Dataset):
+    """Trilinearly resizes CT volumes to a fixed (D, H, W) on load.
+
+    Used to downsample from the quantized_ft default of (240, 480, 480) to the
+    original Merlin training resolution of (160, 224, 224), reducing volume size
+    ~7× and allowing much larger batch sizes.
+    """
+    def __init__(self, ds, target_shape: tuple):
+        self._ds = ds
+        self._target = tuple(target_shape)  # (D, H, W)
+
+    def __len__(self):
+        return len(self._ds)
+
+    @property
+    def label_names(self):
+        return self._ds.label_names
+
+    def __getitem__(self, i):
+        x, y = self._ds[i]               # x: (1, D, H, W)
+        if tuple(x.shape[1:]) != self._target:
+            x = F.interpolate(
+                x.unsqueeze(0),          # (1, 1, D, H, W)
+                size=self._target,
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)                 # (1, D, H, W)
+        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +149,10 @@ def cache_teacher_features(teacher: MerlinEncoder, loader: DataLoader,
 def train_epoch(student, teacher_cache, loader, optimizer, scheduler,
                 w_bits_range, a_bits_range, device, use_amp, amp_dtype, grad_accum, scaler):
     student.train()
+    # Re-freeze BN after .train() — .train() re-enables BN update mode on all submodules
+    for m in student.modules():
+        if isinstance(m, (nn.BatchNorm3d, nn.SyncBatchNorm)):
+            m.eval()
     total_loss = n_samples = step = 0
     optimizer.zero_grad()
 
@@ -170,30 +204,47 @@ def train_epoch(student, teacher_cache, loader, optimizer, scheduler,
 
 
 @torch.no_grad()
-def validate_epoch(student, teacher, val_loader, device, use_amp, amp_dtype, val_bits):
-    """Compute QIT cosine loss on validation set (teacher forward computed online)."""
+def validate_epoch(student, teacher, val_loader, device, use_amp, amp_dtype, val_configs):
+    """Deterministic validation cycling through val_configs.
+
+    For each batch, a config from val_configs is selected by index (round-robin), so
+    over a full pass every config is exercised roughly equally regardless of val-set size.
+
+    Returns (mean_qit_loss, mean_fp_sim) where:
+      - mean_qit_loss  : mean cosine distance between student (at cycled quant config) and teacher FP
+      - mean_fp_sim    : mean cosine similarity between student FP features and teacher FP features
+    """
     student.eval()
     teacher.eval()
-    total_loss = n_samples = 0
-    w_bits, a_bits = val_bits
+    total_qit_loss = total_fp_sim = n_batches = 0
 
-    for batch in val_loader:
+    for i, batch in enumerate(val_loader):
         _, x, _ = batch[0], batch[1], batch[2]
         x = x.to(device)
-        t_f = _fp_forward(teacher, x, use_amp, amp_dtype)
+        _, w_bits, a_bits = val_configs[i % len(val_configs)]
 
-        if use_amp:
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
+        t_f  = _fp_forward(teacher, x, use_amp, amp_dtype)
+        s_fp = _fp_forward(student,  x, use_amp, amp_dtype)
+
+        if w_bits is not None:
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
+                        s_q = student(x)
+            else:
                 with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
-                    s_f = student(x)
+                    s_q = student(x)
         else:
-            with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
-                s_f = student(x)
+            s_q = s_fp
 
-        total_loss += _qit_loss(s_f, t_f).item() * len(x)
-        n_samples  += len(x)
+        total_qit_loss += _qit_loss(s_q, t_f).item()
+        total_fp_sim   += F.cosine_similarity(
+            F.normalize(s_fp.float(), dim=-1),
+            F.normalize(t_f.float(),  dim=-1),
+        ).mean().item()
+        n_batches += 1
 
-    return total_loss / max(n_samples, 1)
+    return total_qit_loss / max(n_batches, 1), total_fp_sim / max(n_batches, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +365,7 @@ def main():
                         help="CSV with 30 binary disease condition labels.")
     parser.add_argument("--metadata",    default=_DEFAULT_METADATA,
                         help="CSV with per-scan spacing metadata (optional, improves preprocessing).")
-    parser.add_argument("--patience",    type=int, default=0,
+    parser.add_argument("--patience",    type=int, default=10,
                         help="Early stopping: stop if val QIT loss does not improve for "
                              "this many validation checks. 0 = disabled.")
     parser.add_argument("--n_train",     type=int, default=None,
@@ -328,21 +379,19 @@ def main():
                         help="Label columns to train/evaluate on. Defaults to the three "
                              "conditions with the best label coverage in this dataset.")
     # Training
-    parser.add_argument("--epochs",          type=int,   default=20)
-    parser.add_argument("--batch_size",      type=int,   default=2)
-    parser.add_argument("--grad_accum",      type=int,   default=1,
+    parser.add_argument("--epochs",          type=int,   default=30)
+    parser.add_argument("--batch_size",      type=int,   default=16)
+    parser.add_argument("--grad_accum",      type=int,   default=2,
                         help="Gradient accumulation steps. Effective batch = batch_size × grad_accum.")
     parser.add_argument("--lr",              type=float, default=1e-5,
                         help="Lower than standard backbones — Merlin is a large pretrained model.")
-    parser.add_argument("--w_bits_min",      type=int,   default=2)
+    parser.add_argument("--w_bits_min",      type=int,   default=4)
     parser.add_argument("--w_bits_max",      type=int,   default=8)
     parser.add_argument("--a_bits_min",      type=int,   default=4)
     parser.add_argument("--a_bits_max",      type=int,   default=8)
     parser.add_argument("--val_every",       type=int,   default=1,
-                        help="Compute val QIT loss every N epochs.")
-    parser.add_argument("--val_bits",        type=int,   nargs=2, default=[8, 8],
-                        metavar=("W", "A"),
-                        help="Bit-widths used for per-epoch validation QIT loss.")
+                        help="Compute val metrics every N epochs. "
+                             "Validation cycles through all eval configs deterministically.")
     # System
     parser.add_argument("--num_workers",          type=int,   default=4)
     parser.add_argument("--output_dir",            default=None)
@@ -350,6 +399,11 @@ def main():
     parser.add_argument("--amp_dtype",  default="fp16", choices=["fp16", "bf16"],
                         help="AMP dtype. fp16 matches the original Merlin training; "
                              "bf16 is more numerically stable but slower on some hardware.")
+    parser.add_argument("--target_shape", type=int, nargs=3, default=None,
+                        metavar=("D", "H", "W"),
+                        help="Resize volumes to (D H W) after loading via trilinear interpolation. "
+                             "Use '160 224 224' to match original Merlin training resolution and "
+                             "reduce memory ~7× vs the default (240 480 480). Default: no resize.")
     args = parser.parse_args()
 
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -369,8 +423,11 @@ def main():
     print(f"  data_dir  : {args.data_dir}")
     print(f"  epochs    : {args.epochs}  lr={args.lr}  bs={args.batch_size}"
           f"  grad_accum={args.grad_accum}")
-    print(f"  val_every : {args.val_every}  val_bits=W{args.val_bits[0]}A{args.val_bits[1]}")
+    _cfg_str = ", ".join(n for n, *_ in _EVAL_CONFIGS)
+    print(f"  val_every : {args.val_every}  val_configs=[{_cfg_str}] (cycled deterministically)")
     print(f"  amp       : {use_amp} ({args.amp_dtype})")
+    _shape_str = "×".join(map(str, args.target_shape)) if args.target_shape else "native (240×480×480)"
+    print(f"  vol_shape : {_shape_str}")
     print(f"  output    : {out}")
     print("=" * 70)
 
@@ -392,6 +449,12 @@ def main():
         idx = rng.choice(len(val_ds), args.n_val, replace=False).tolist()
         val_ds = torch.utils.data.Subset(val_ds, sorted(idx))
 
+    if args.target_shape is not None:
+        target = tuple(args.target_shape)
+        train_ds = _ResizedDataset(train_ds, target)
+        val_ds   = _ResizedDataset(val_ds,   target)
+        test_ds  = _ResizedDataset(test_ds,  target)
+
     print(f"  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)}")
     print(f"  conditions ({len(label_names)}): {', '.join(label_names)}\n")
 
@@ -411,8 +474,19 @@ def main():
         p.requires_grad_(False)
 
     student = MerlinEncoder().to(device)
+    # Freeze BatchNorm: prevents (1) running-stat corruption from the double-update
+    # caused by gradient checkpointing recompute, and (2) small-batch degeneracy.
+    # Pre-trained stats from Merlin are already well-calibrated.
+    _bn_count = 0
+    for m in student.modules():
+        if isinstance(m, (nn.BatchNorm3d, nn.SyncBatchNorm)):
+            m.eval()
+            m.weight.requires_grad_(False)
+            m.bias.requires_grad_(False)
+            _bn_count += 1
 
     print(f"  encoder params: {sum(p.numel() for p in student.image_encoder.parameters()):,}")
+    print(f"  BatchNorm layers frozen: {_bn_count} (running stats fixed, no grad-checkpoint double-update)")
     print("  gradient checkpointing: always-on (built into I3ResNet)")
 
     # ── cache teacher features ────────────────────────────────────────────
@@ -431,7 +505,7 @@ def main():
 
     # ── training ──────────────────────────────────────────────────────────
     print(f"\n{'Training':=^70}")
-    print(f"{'Epoch':>6}  {'train_loss':>12}  {'val_loss':>10}")
+    print(f"{'Epoch':>6}  {'train_loss':>12}  {'val_loss':>10}  {'val_fp_sim':>12}")
 
     epoch_log      = []
     best_val_loss  = float("inf")
@@ -445,11 +519,11 @@ def main():
             device, use_amp, amp_dtype, args.grad_accum, scaler,
         )
 
-        val_loss = None
+        val_loss = val_fp_sim = None
         saved    = ""
         if epoch % args.val_every == 0 or epoch == args.epochs:
-            val_loss = validate_epoch(student, teacher, val_loader, device,
-                                      use_amp, amp_dtype, tuple(args.val_bits))
+            val_loss, val_fp_sim = validate_epoch(
+                student, teacher, val_loader, device, use_amp, amp_dtype, _EVAL_CONFIGS)
             if val_loss < best_val_loss:
                 best_val_loss  = val_loss
                 best_val_epoch = epoch
@@ -460,14 +534,16 @@ def main():
             else:
                 no_improve += 1
 
-        val_str = f"{val_loss:10.6f}" if val_loss is not None else f"{'—':>10}"
-        marker  = " *" if saved else ""
-        print(f"{epoch:6d}  {tr_loss:12.6f}  {val_str}{marker}")
+        val_str    = f"{val_loss:10.6f}"   if val_loss    is not None else f"{'—':>10}"
+        fp_sim_str = f"{val_fp_sim:12.4f}" if val_fp_sim  is not None else f"{'—':>12}"
+        marker     = " *" if saved else ""
+        print(f"{epoch:6d}  {tr_loss:12.6f}  {val_str}  {fp_sim_str}{marker}", flush=True)
 
         epoch_log.append({
             "epoch":      epoch,
             "train_loss": round(tr_loss, 7),
-            "val_loss":   round(val_loss, 7) if val_loss is not None else None,
+            "val_loss":   round(val_loss,   7) if val_loss   is not None else None,
+            "val_fp_sim": round(val_fp_sim, 4) if val_fp_sim is not None else None,
         })
 
         if args.patience > 0 and no_improve >= args.patience:
@@ -489,21 +565,24 @@ def main():
     test_loader       = DataLoader(test_ds,  **eval_loader_kw)
 
     auroc_results = {}
+
+    # Student at every quant config
     for cfg_name, wb, ab in _EVAL_CONFIGS:
-        print(f"\n  [{cfg_name}] extracting features...")
+        print(f"\n  [student {cfg_name}] extracting features...")
         tr_f, tr_l = extract_features(student, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
         te_f, te_l = extract_features(student, test_loader,       device, use_amp, amp_dtype, wb, ab)
         mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
-        auroc_results[cfg_name] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
+        auroc_results[f"student_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
         print(f"    mean AUROC = {mean_auc:.4f}")
 
-    # teacher baseline
-    print("\n  [teacher fp] extracting features...")
-    tr_f, tr_l = extract_features(teacher, train_eval_loader, device, use_amp, amp_dtype)
-    te_f, te_l = extract_features(teacher, test_loader,       device, use_amp, amp_dtype)
-    mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
-    auroc_results["teacher_fp"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
-    print(f"    mean AUROC (teacher) = {mean_auc:.4f}")
+    # Teacher at every quant config (direct comparison baseline)
+    for cfg_name, wb, ab in _EVAL_CONFIGS:
+        print(f"\n  [teacher {cfg_name}] extracting features...")
+        tr_f, tr_l = extract_features(teacher, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
+        te_f, te_l = extract_features(teacher, test_loader,       device, use_amp, amp_dtype, wb, ab)
+        mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
+        auroc_results[f"teacher_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
+        print(f"    mean AUROC = {mean_auc:.4f}")
 
     # ── save ──────────────────────────────────────────────────────────────
     results = {

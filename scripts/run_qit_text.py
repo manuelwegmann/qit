@@ -173,7 +173,8 @@ def cache_teacher_features(teacher, loader, device, use_amp):
 
 
 @torch.no_grad()
-def extract_features(model, loader, device, use_amp, w_bits=None, a_bits=None):
+def extract_features(model, loader, device, use_amp, w_bits=None, a_bits=None,
+                     weight_granularity="per_channel"):
     model.eval()
     feats, labels = [], []
     for input_ids, attention_mask, y in _pbar(loader, desc="    extracting", leave=False):
@@ -182,7 +183,7 @@ def extract_features(model, loader, device, use_amp, w_bits=None, a_bits=None):
         if w_bits is None:
             f = get_cls(model, input_ids, attention_mask, use_amp)
         else:
-            with quantized_forward([model], w_bits, a_bits):
+            with quantized_forward([model], w_bits, a_bits, weight_granularity):
                 f = get_cls(model, input_ids, attention_mask, use_amp)
         feats.append(f.cpu()); labels.append(y)
     return torch.cat(feats).numpy(), torch.cat(labels).numpy()
@@ -191,7 +192,8 @@ def extract_features(model, loader, device, use_amp, w_bits=None, a_bits=None):
 # ── training / validation ─────────────────────────────────────────────────────
 
 def train_epoch(student, loader, optimizer, loss_type, bit_sampler,
-                device, use_amp, teacher_feats_cache, fp_loss_weight=0.0):
+                device, use_amp, teacher_feats_cache, fp_loss_weight=0.0,
+                weight_granularity="per_channel"):
     student.train()
     total_loss = total_fp_sim = n = 0
 
@@ -202,7 +204,7 @@ def train_epoch(student, loader, optimizer, loss_type, bit_sampler,
         w_bits, a_bits = bit_sampler.sample()
 
         optimizer.zero_grad()
-        with quantized_forward([student], w_bits, a_bits):
+        with quantized_forward([student], w_bits, a_bits, weight_granularity):
             z_student_q = get_cls(student, input_ids, attention_mask, use_amp)
         loss = compute_qit_loss(z_student_q, z_teacher, loss_type)
 
@@ -224,7 +226,8 @@ def train_epoch(student, loader, optimizer, loss_type, bit_sampler,
 
 
 @torch.no_grad()
-def validate_epoch(student, loader, loss_type, all_configs, device, use_amp, teacher_feats_cache):
+def validate_epoch(student, loader, loss_type, all_configs, device, use_amp, teacher_feats_cache,
+                   weight_granularity="per_channel"):
     student.eval()
     total_loss = total_fp_sim = n = 0
 
@@ -234,7 +237,7 @@ def validate_epoch(student, loader, loss_type, all_configs, device, use_amp, tea
         z_teacher      = teacher_feats_cache[full_idx].to(device)
         w_bits, a_bits = all_configs[i % len(all_configs)]
 
-        with quantized_forward([student], w_bits, a_bits):
+        with quantized_forward([student], w_bits, a_bits, weight_granularity):
             z_student = get_cls(student, input_ids, attention_mask, use_amp)
         z_fp = get_cls(student, input_ids, attention_mask, use_amp)
 
@@ -262,6 +265,8 @@ def main():
     parser.add_argument("--loss",            type=str,   default="cosine",
                         choices=["cosine", "mse", "kl"])
     parser.add_argument("--fp_loss_weight",  type=float, default=0.0)
+    parser.add_argument("--weight_granularity", type=str, default="per_channel",
+                        choices=["per_tensor", "per_channel"])
     parser.add_argument("--bit_sampling",    type=str,   default="wor",
                         choices=["wor", "random"])
     parser.add_argument("--w_bits_min",      type=int,   default=2)
@@ -298,6 +303,7 @@ def main():
     print(f"  batch_size   : {args.batch_size}")
     print(f"  loss         : {args.loss}  fp_loss_weight: {args.fp_loss_weight}")
     print(f"  w_bits range : {w_range}  a_bits range: {a_range}")
+    print(f"  weight_gran  : {args.weight_granularity}")
     print(f"  amp          : {use_amp}")
     print(f"  output       : {out}\n")
 
@@ -386,10 +392,12 @@ def main():
             student, qit_train_loader, optimizer, args.loss,
             bit_sampler, device, use_amp, teacher_feats_cache,
             fp_loss_weight=args.fp_loss_weight,
+            weight_granularity=args.weight_granularity,
         )
         val_loss, val_fp_sim = validate_epoch(
             student, qit_val_loader, args.loss,
             all_configs, device, use_amp, teacher_feats_cache,
+            weight_granularity=args.weight_granularity,
         )
 
         val_history.append(val_loss)
@@ -452,10 +460,10 @@ def main():
 
     for qk, wb, ab in QUANT_CONFIGS:
         print(f"\n  [{qk}] extracting features...")
-        t_tr, l_tr = extract_features(teacher, probe_train_loader, device, use_amp, wb, ab)
-        s_tr, _    = extract_features(student, probe_train_loader, device, use_amp, wb, ab)
-        t_te, l_te = extract_features(teacher, probe_test_loader,  device, use_amp, wb, ab)
-        s_te, _    = extract_features(student, probe_test_loader,  device, use_amp, wb, ab)
+        t_tr, l_tr = extract_features(teacher, probe_train_loader, device, use_amp, wb, ab, args.weight_granularity)
+        s_tr, _    = extract_features(student, probe_train_loader, device, use_amp, wb, ab, args.weight_granularity)
+        t_te, l_te = extract_features(teacher, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
+        s_te, _    = extract_features(student, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
 
         feat_sim    = float(F.cosine_similarity(torch.tensor(s_tr), torch.tensor(t_tr)).mean())
         teacher_acc = run_probe(t_tr, l_tr, t_te, l_te, device)

@@ -18,19 +18,20 @@ fi
 
 MODEL="${MODEL:-distilbert-base-uncased}"
 DATASET="${DATASET:-sst2}"
-N_TRAIN="${N_TRAIN:-7000}"
+N_TRAIN="${N_TRAIN:-15000}"
 EPOCHS="${EPOCHS:-50}"
 PATIENCE="${PATIENCE:-10}"
 VAL_WINDOW="${VAL_WINDOW:-3}"
-LR="${LR:-1e-4}"
+LR="${LR:-2e-5}"
 LR_SCHEDULE="${LR_SCHEDULE:-cosine}"
 LOSS="${LOSS:-cosine}"
 FP_LOSS_WEIGHT="${FP_LOSS_WEIGHT:-0.0}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
-W_BITS_MIN="${W_BITS_MIN:-2}"
-W_BITS_MAX="${W_BITS_MAX:-4}"
+W_BITS_MIN="${W_BITS_MIN:-4}"
+W_BITS_MAX="${W_BITS_MAX:-8}"
 A_BITS_MIN="${A_BITS_MIN:-4}"
 A_BITS_MAX="${A_BITS_MAX:-8}"
+WEIGHT_GRANULARITY="${WEIGHT_GRANULARITY:-per_channel}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/qit_${DATASET}_$(echo ${MODEL} | tr '/' '_')}"
 
@@ -39,7 +40,7 @@ VENV="${PROJECT_DIR}/venv"
 
 echo "=== qit_text  job=${SLURM_JOB_ID}  node=$(hostname) ==="
 echo "model=${MODEL}  dataset=${DATASET}  n_train=${N_TRAIN}  epochs=${EPOCHS}  patience=${PATIENCE}  val_window=${VAL_WINDOW}"
-echo "lr=${LR} (${LR_SCHEDULE})  loss=${LOSS}  bs=${BATCH_SIZE}  w=[${W_BITS_MIN},${W_BITS_MAX}]  a=[${A_BITS_MIN},${A_BITS_MAX}]"
+echo "lr=${LR} (${LR_SCHEDULE})  loss=${LOSS}  bs=${BATCH_SIZE}  w=[${W_BITS_MIN},${W_BITS_MAX}]  a=[${A_BITS_MIN},${A_BITS_MAX}]  wgran=${WEIGHT_GRANULARITY}"
 date
 
 export HF_DATASETS_OFFLINE=1
@@ -67,7 +68,8 @@ python scripts/run_qit_text.py \
     --w_bits_max      "${W_BITS_MAX}"     \
     --a_bits_min      "${A_BITS_MIN}"     \
     --a_bits_max      "${A_BITS_MAX}"     \
-    --num_workers     "${NUM_WORKERS}"    \
-    --output_dir      "${OUTPUT_DIR}"
+    --num_workers         "${NUM_WORKERS}"        \
+    --weight_granularity  "${WEIGHT_GRANULARITY}" \
+    --output_dir          "${OUTPUT_DIR}"
 
 echo "=== done ===" && date

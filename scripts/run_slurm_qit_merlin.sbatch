@@ -3,9 +3,9 @@
 #SBATCH --job-name=qit_merlin
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.out
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --mem=80G
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=14
 #SBATCH --time=24:00:00
 #SBATCH --exclude=hendrixgpu05fl,hendrixgpu06fl,hendrixgpu09fl,hendrixgpu10fl,hendrixgpu11fl,hendrixgpu12fl,hendrixgpu13fl,hendrixgpu17fl,hendrixgpu18fl,hendrixgpu19fl,hendrixgpu20fl
 
@@ -14,11 +14,13 @@ echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)  (${
 
 # ── Configurable via env vars ─────────────────────────────────────────────────
 #
-# Default run (all data, W2-8 A4-8, 20 epochs):
+# Default (160×224×224, W4-8 A4-8, 30 epochs, patience=10, bs=16 ga=2, H100):
 #   sbatch scripts/run_slurm_qit_merlin.sbatch
 #
-# Longer run with gradient accumulation (effective batch = 4):
-#   EPOCHS=30 GRAD_ACCUM=4 OUTPUT_DIR=runs/qit_merlin_long sbatch scripts/run_slurm_qit_merlin.sbatch
+# Override GPU type on the command line:
+#   sbatch --gres=gpu:l40s:1  ...   (L40S  46 GB — use bs=16 ga=2)
+#   sbatch --gres=gpu:a100:1  ...   (A100  80 GB — use bs=12 ga=4)
+#   sbatch --gres=gpu:h100:1  ...   (H100  80 GB — use bs=24 ga=1)
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -27,21 +29,22 @@ REPORTS="${REPORTS:-${SLURM_SUBMIT_DIR}/../CT-CLIP/data/reports_final.xlsx}"
 LABELS="${LABELS:-${SLURM_SUBMIT_DIR}/../CT-CLIP/data/zero_shot_findings_disease_cls.csv}"
 METADATA="${METADATA:-${SLURM_SUBMIT_DIR}/../CT-CLIP/data/metadata.csv}"
 
-EPOCHS="${EPOCHS:-20}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+EPOCHS="${EPOCHS:-30}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
 LR="${LR:-1e-5}"
-W_BITS_MIN="${W_BITS_MIN:-2}"
+W_BITS_MIN="${W_BITS_MIN:-4}"
 W_BITS_MAX="${W_BITS_MAX:-8}"
 A_BITS_MIN="${A_BITS_MIN:-4}"
 A_BITS_MAX="${A_BITS_MAX:-8}"
 VAL_EVERY="${VAL_EVERY:-1}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-12}"
 AMP_DTYPE="${AMP_DTYPE:-fp16}"
 CONDITIONS="${CONDITIONS:-atelectasis pleural_effusion renal_cyst}"
 N_TRAIN="${N_TRAIN:-2000}"
 N_VAL="${N_VAL:-500}"
-PATIENCE="${PATIENCE:-0}"
+PATIENCE="${PATIENCE:-10}"
+TARGET_SHAPE="${TARGET_SHAPE:-160 224 224}"  # paper's 1.5 mm in-plane / 3 mm z resolution
 OUTPUT_DIR="${OUTPUT_DIR:-runs/qit_merlin_w${W_BITS_MIN}-${W_BITS_MAX}a${A_BITS_MIN}-${A_BITS_MAX}}"
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR}"
@@ -60,7 +63,7 @@ python -c "import torch; print('torch', torch.__version__, '| cuda', torch.cuda.
 
 cd "${PROJECT_DIR}"
 
-python scripts/run_qit_merlin.py \
+python -u scripts/run_qit_merlin.py \
     --data_dir    "${DATA_DIR}"    \
     --reports     "${REPORTS}"     \
     --labels      "${LABELS}"      \
@@ -80,6 +83,7 @@ python scripts/run_qit_merlin.py \
     --n_train     "${N_TRAIN}"     \
     --n_val       "${N_VAL}"       \
     --patience    "${PATIENCE}"    \
-    --output_dir  "${OUTPUT_DIR}"
+    --output_dir  "${OUTPUT_DIR}"  \
+    ${TARGET_SHAPE:+--target_shape $TARGET_SHAPE}
 
 echo "=== done ===" && date

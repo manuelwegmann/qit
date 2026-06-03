@@ -8,3 +8,4 @@ __pycache__/
 .DS_Store
 cluster_info.md
 *.out
+notes.md
