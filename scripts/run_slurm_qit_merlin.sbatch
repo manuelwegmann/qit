@@ -50,6 +50,12 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/qit_merlin_w${W_BITS_MIN}-${W_BITS_MAX}a${A_BITS_
 PROJECT_DIR="${SLURM_SUBMIT_DIR}"
 VENV="${PROJECT_DIR}/venv"
 
+# /tmp on shared nodes fills up quickly with many concurrent jobs (worker IPC sockets).
+# Point Python's tempfile module at a per-job directory inside the project to avoid ENOSPC.
+export TMPDIR="${PROJECT_DIR}/.tmp_${SLURM_JOB_ID}"
+mkdir -p "${TMPDIR}"
+trap "rm -rf '${TMPDIR}'" EXIT
+
 echo "=== qit_merlin  job=${SLURM_JOB_ID}  node=$(hostname) ==="
 echo "data_dir=${DATA_DIR}"
 echo "epochs=${EPOCHS}  batch_size=${BATCH_SIZE}  grad_accum=${GRAD_ACCUM}  lr=${LR}  amp=${AMP_DTYPE}"
@@ -84,6 +90,7 @@ python -u scripts/run_qit_merlin.py \
     --n_val       "${N_VAL}"       \
     --patience    "${PATIENCE}"    \
     --output_dir  "${OUTPUT_DIR}"  \
-    ${TARGET_SHAPE:+--target_shape $TARGET_SHAPE}
+    ${TARGET_SHAPE:+--target_shape $TARGET_SHAPE} \
+    ${EVAL_ONLY:+--eval_only}
 
 echo "=== done ===" && date

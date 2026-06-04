@@ -151,7 +151,7 @@ def train_epoch(student, teacher_cache, loader, optimizer, scheduler,
     student.train()
     # Re-freeze BN after .train() — .train() re-enables BN update mode on all submodules
     for m in student.modules():
-        if isinstance(m, (nn.BatchNorm3d, nn.SyncBatchNorm)):
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
             m.eval()
     total_loss = n_samples = step = 0
     optimizer.zero_grad()
@@ -395,6 +395,9 @@ def main():
     # System
     parser.add_argument("--num_workers",          type=int,   default=4)
     parser.add_argument("--output_dir",            default=None)
+    parser.add_argument("--eval_only",             action="store_true",
+                        help="Skip training and run test evaluation only. "
+                             "Requires checkpoint_best.pt to exist in --output_dir.")
     parser.add_argument("--no_amp",                action="store_true")
     parser.add_argument("--amp_dtype",  default="fp16", choices=["fp16", "bf16"],
                         help="AMP dtype. fp16 matches the original Merlin training; "
@@ -479,7 +482,7 @@ def main():
     # Pre-trained stats from Merlin are already well-calibrated.
     _bn_count = 0
     for m in student.modules():
-        if isinstance(m, (nn.BatchNorm3d, nn.SyncBatchNorm)):
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
             m.eval()
             m.weight.requires_grad_(False)
             m.bias.requires_grad_(False)
@@ -491,28 +494,32 @@ def main():
 
     # ── cache teacher features ────────────────────────────────────────────
     print("\nCaching teacher features for training set...")
-    teacher_cache = cache_teacher_features(teacher, train_loader, device, use_amp, amp_dtype)
-    print(f"  cached {len(teacher_cache)} samples ({len(teacher_cache) * 2048 * 4 / 1e6:.1f} MB)\n")
+    if not args.eval_only:
+        teacher_cache = cache_teacher_features(teacher, train_loader, device, use_amp, amp_dtype)
+        print(f"  cached {len(teacher_cache)} samples ({len(teacher_cache) * 2048 * 4 / 1e6:.1f} MB)\n")
 
     # ── optimizer / scheduler / scaler ───────────────────────────────────
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr,
-                                   betas=(0.9, 0.999), weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
-    # GradScaler only needed for FP16 (BF16 has sufficient dynamic range without it)
-    scaler = (torch.amp.GradScaler("cuda")
-              if use_amp and amp_dtype == torch.float16 else None)
+    if not args.eval_only:
+        optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr,
+                                       betas=(0.9, 0.999), weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+        scaler = (torch.amp.GradScaler("cuda")
+                  if use_amp and amp_dtype == torch.float16 else None)
 
     # ── training ──────────────────────────────────────────────────────────
-    print(f"\n{'Training':=^70}")
-    print(f"{'Epoch':>6}  {'train_loss':>12}  {'val_loss':>10}  {'val_fp_sim':>12}")
+    if args.eval_only:
+        print("\n[eval_only] Skipping training — loading checkpoint_best.pt")
+    else:
+        print(f"\n{'Training':=^70}")
+        print(f"{'Epoch':>6}  {'train_loss':>12}  {'val_loss':>10}  {'val_fp_sim':>12}")
 
     epoch_log      = []
     best_val_loss  = float("inf")
     best_val_epoch = 0
     no_improve     = 0
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, args.epochs + 1) if not args.eval_only else []:
         tr_loss = train_epoch(
             student, teacher_cache, train_loader, optimizer, scheduler,
             (args.w_bits_min, args.w_bits_max), (args.a_bits_min, args.a_bits_max),
@@ -551,16 +558,19 @@ def main():
                   f"{args.patience} validation checks (every {args.val_every} epochs).")
             break
 
-    torch.save({"epoch": args.epochs, "student": student.state_dict()},
-               out / "checkpoint_final.pt")
+    if not args.eval_only:
+        torch.save({"epoch": args.epochs, "student": student.state_dict()},
+                   out / "checkpoint_final.pt")
 
     # ── test evaluation ───────────────────────────────────────────────────
     print(f"\n{'Test evaluation':=^70}")
     ckpt = torch.load(out / "checkpoint_best.pt", map_location=device)
     student.load_state_dict(ckpt["student"])
 
+    # num_workers=0 runs loading in the main process — avoids /tmp IPC socket exhaustion
+    # on shared nodes with many concurrent jobs.
     eval_loader_kw = dict(batch_size=args.batch_size, shuffle=False,
-                          num_workers=2, pin_memory=device.type == "cuda")
+                          num_workers=0, pin_memory=False)
     train_eval_loader = DataLoader(train_ds, **eval_loader_kw)
     test_loader       = DataLoader(test_ds,  **eval_loader_kw)
 

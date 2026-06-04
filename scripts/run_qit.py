@@ -56,6 +56,119 @@ class _IndexedSubset(torch.utils.data.Dataset):
         return x, y, self.subset.indices[idx]
 
 
+# ---------------------------------------------------------------------------
+# Layer-wise CKA
+# ---------------------------------------------------------------------------
+
+# Verified layer names for each backbone (named_modules paths).
+# Chosen to give ~4 evenly-spaced checkpoints through the network depth.
+_CKA_LAYERS: dict = {
+    "resnet18": [
+        "layer1", "layer2", "layer3", "layer4",
+    ],
+    "efficientnet_b0": [
+        "features.2", "features.4", "features.6", "features.8",
+    ],
+    "mobilenet_v3_small": [
+        "features.3", "features.6", "features.9", "features.12",
+    ],
+    "vit_b_16": [
+        "encoder.layers.encoder_layer_2",
+        "encoder.layers.encoder_layer_5",
+        "encoder.layers.encoder_layer_8",
+        "encoder.layers.encoder_layer_11",
+    ],
+    "swin_t": [
+        "features.1", "features.3", "features.5", "features.7",
+    ],
+}
+
+
+def _pool_to_2d(t: torch.Tensor) -> torch.Tensor:
+    """Collapse spatial / sequence dims to (N, D) so CKA can operate on a matrix."""
+    if t.dim() == 4:    # (N, C, H, W) — CNN feature map → global avg pool
+        return t.flatten(2).mean(2)
+    if t.dim() == 3:    # (N, seq, D) — transformer sequence → mean over tokens
+        return t.mean(1)
+    return t            # already (N, D)
+
+
+def _linear_cka(X: torch.Tensor, Y: torch.Tensor) -> float:
+    """Linear CKA between two (N, D) representation matrices.
+
+    Invariant to orthogonal transforms and isotropic scaling — measures how
+    similarly the two models organise the same inputs, not just whether their
+    feature vectors point in the same direction.
+    """
+    X = X - X.mean(0)
+    Y = Y - Y.mean(0)
+    num   = torch.norm(Y.T @ X, "fro").item() ** 2
+    denom = torch.norm(X.T @ X, "fro").item() * torch.norm(Y.T @ Y, "fro").item()
+    return num / (denom + 1e-8)
+
+
+@torch.no_grad()
+def compute_layer_cka(teacher: nn.Module, student: nn.Module,
+                      probe_x: torch.Tensor, backbone: str) -> dict:
+    """Compute linear CKA between student and teacher at each named layer.
+
+    Both models are run in eval / no-grad mode on a single probe batch.
+    Spatial and sequence dimensions are collapsed via global average before CKA
+    so the metric is architecture-agnostic.
+
+    Returns an empty dict if the backbone is not in _CKA_LAYERS.
+    """
+    layer_names = _CKA_LAYERS.get(backbone, [])
+    if not layer_names:
+        return {}
+
+    t_acts: dict = {}
+    s_acts: dict = {}
+    hooks  = []
+
+    def _make_hook(store: dict, key: str):
+        def _hook(mod, inp, out):
+            store[key] = _pool_to_2d(out.detach().float().cpu())
+        return _hook
+
+    for model, store in [(teacher, t_acts), (student, s_acts)]:
+        model.eval()
+        for ln in layer_names:
+            mod = model
+            for part in ln.split("."):
+                mod = getattr(mod, part)
+            hooks.append(mod.register_forward_hook(_make_hook(store, ln)))
+
+    teacher(probe_x)
+    student(probe_x)
+
+    for h in hooks:
+        h.remove()
+
+    return {
+        ln: round(_linear_cka(s_acts[ln], t_acts[ln]), 4)
+        for ln in layer_names
+        if ln in s_acts and ln in t_acts
+    }
+
+
+def _freeze_bn(model: nn.Module) -> int:
+    """Set all BatchNorm layers to eval mode with frozen parameters.
+
+    Called once after loading and again after every student.train() call,
+    since .train() recursively re-enables update mode on all submodules.
+    Returns the number of layers frozen (0 for ViT/Swin which use LayerNorm).
+    """
+    count = 0
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
+            m.weight.requires_grad_(False)
+            m.bias.requires_grad_(False)
+            count += 1
+    return count
+
+
 def compute_qit_loss(z_student: torch.Tensor, z_teacher: torch.Tensor,
                      loss_type: str) -> torch.Tensor:
     zt = z_teacher.detach()
@@ -98,8 +211,12 @@ def _fp_forward(student, x, use_amp):
 def train_epoch(student, loader, optimizer, loss_type,
                 bit_sampler, device, use_amp,
                 teacher_feats_cache, weight_granularity="per_tensor",
-                fp_loss_weight=0.0, teacher_params=None, reg_weight=0.0):
+                fp_loss_weight=0.0, teacher_params=None, reg_weight=0.0,
+                freeze_bn=False):
     student.train()
+    if freeze_bn:
+        # .train() re-enables BN update mode on all submodules; re-freeze immediately.
+        _freeze_bn(student)
     total_loss = total_fp_sim = n = 0
 
     for x, _, full_idx in _pbar(loader, desc="  batches", leave=False):
@@ -228,6 +345,21 @@ def main():
                              "and the labeled train/test splits for probing.")
     parser.add_argument("--data_dir",    type=str,   default=None,
                         help="Dataset root dir. Defaults to data/<dataset>.")
+    parser.add_argument("--log_layer_cka", action="store_true",
+                        help="After each validation step, compute linear CKA between "
+                             "student (FP) and teacher at ~4 key layers and log to "
+                             "results.json. Uses the first val batch as a probe — "
+                             "overhead is one extra forward pass per epoch (<1 s). "
+                             "Default: off.")
+    parser.add_argument("--freeze_bn",    action="store_true",
+                        help="Freeze BatchNorm layers throughout training (eval mode, "
+                             "no grad on scale/bias). Recommended for CNN backbones on "
+                             "low-resolution datasets (e.g. ResNet18/CIFAR-10): QIT mixes "
+                             "FP and quantized passes each step, which corrupts BN running "
+                             "stats; the student weights then adapt to the wrong "
+                             "normalisation, and post-hoc recalibration cannot undo this. "
+                             "ViT/Swin are unaffected (they use LayerNorm). Default: off, "
+                             "preserving the behaviour validated on STL-10.")
     parser.add_argument("--no_amp",      action="store_true")
     parser.add_argument("--output_dir",  type=str,   default=None,
                         help="Output dir. Defaults to runs/qit_<dataset>_<backbone>.")
@@ -319,6 +451,13 @@ def main():
     print(f"Loading student (same ImageNet-pretrained weights)...")
     student = build_backbone(args.backbone).to(device)
 
+    if args.freeze_bn:
+        n_frozen = _freeze_bn(student)
+        if n_frozen:
+            print(f"  BN freeze enabled: {n_frozen} layers frozen for training.")
+        else:
+            print("  BN freeze requested but no BatchNorm layers found (no-op for this backbone).")
+
     results        = {"epochs": [], "probe": {}}
     best_ckpt_path = out / "checkpoint_best.pt"
 
@@ -366,6 +505,7 @@ def main():
             fp_loss_weight=args.fp_loss_weight,
             teacher_params=teacher_params,
             reg_weight=args.reg_weight,
+            freeze_bn=args.freeze_bn,
         )
         val_loss, val_fp_sim = validate_epoch(
             student, val_loader, args.loss,
@@ -383,15 +523,27 @@ def main():
         elif window_full:
             epochs_no_improve += 1
 
+        # Optional layer-wise CKA: one extra FP forward pass on a single probe
+        # batch — overhead is negligible (<1 s per epoch).
+        layer_cka = {}
+        if args.log_layer_cka:
+            probe_x, _, _ = next(iter(val_loader))
+            layer_cka = compute_layer_cka(
+                teacher, student, probe_x.to(device), args.backbone)
+
         marker = f" *best* (avg={avg_val:.4f})" if is_best else (
                  f" (avg={avg_val:.4f})" if window_full else "")
         print(f"[epoch {epoch:3d}/{args.epochs}]  "
               f"loss={loss:.4f}  fp_sim={fp_sim:.4f}  |  "
               f"val_loss={val_loss:.4f}  val_fp_sim={val_fp_sim:.4f}{marker}")
-        results["epochs"].append({
+
+        log_entry = {
             "epoch": epoch, "loss": loss, "fp_sim": fp_sim,
             "val_loss": val_loss, "val_fp_sim": val_fp_sim,
-        })
+        }
+        if layer_cka:
+            log_entry["layer_cka"] = layer_cka
+        results["epochs"].append(log_entry)
 
         slot = (epoch - 1) % args.val_window
         ckpt = {"epoch": epoch, "student": student.state_dict()}
@@ -434,8 +586,12 @@ def main():
     # The teacher is NOT recalibrated — its ImageNet BN stats are already
     # correct for its learned features, and recalibrating on a different
     # domain degrades feature quality.
-    has_bn = any(isinstance(m, nn.BatchNorm2d) for m in student.modules())
-    if has_bn:
+    has_bn = any(isinstance(m, nn.modules.batchnorm._BatchNorm)
+                 for m in student.modules())
+    if has_bn and not args.freeze_bn:
+        # Post-hoc recalibration: reset BN running stats with a clean FP pass.
+        # Only needed when BN was NOT frozen during training; if freeze_bn was
+        # used the stats were never corrupted and this step is unnecessary.
         print("Recalibrating student BN stats...")
         student.train()
         with torch.no_grad():
@@ -448,8 +604,10 @@ def main():
                     student(x)
         student.eval()
         print("  Done.\n")
-    else:
+    elif not has_bn:
         print("Skipping BN recalibration (no BatchNorm layers).\n")
+    else:
+        print("Skipping BN recalibration (BN was frozen throughout training).\n")
 
     # ── probe ─────────────────────────────────────────────────────────────
     print(f"\n{'Probe evaluation':=^70}")

@@ -9,3 +9,4 @@ __pycache__/
 cluster_info.md
 *.out
 notes.md
+log_archive/
