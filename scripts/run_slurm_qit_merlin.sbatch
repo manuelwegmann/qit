@@ -39,11 +39,13 @@ A_BITS_MIN="${A_BITS_MIN:-4}"
 A_BITS_MAX="${A_BITS_MAX:-8}"
 VAL_EVERY="${VAL_EVERY:-1}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
-AMP_DTYPE="${AMP_DTYPE:-fp16}"
+AMP_DTYPE="${AMP_DTYPE:-bf16}"
 CONDITIONS="${CONDITIONS:-atelectasis pleural_effusion renal_cyst}"
 N_TRAIN="${N_TRAIN:-2000}"
 N_VAL="${N_VAL:-500}"
 PATIENCE="${PATIENCE:-10}"
+FREEZE_LAYERS="${FREEZE_LAYERS:-0}"
+FREEZE_BN="${FREEZE_BN:-}"              # set to 1 to freeze BN layers
 TARGET_SHAPE="${TARGET_SHAPE:-160 224 224}"  # paper's 1.5 mm in-plane / 3 mm z resolution
 OUTPUT_DIR="${OUTPUT_DIR:-runs/qit_merlin_w${W_BITS_MIN}-${W_BITS_MAX}a${A_BITS_MIN}-${A_BITS_MAX}}"
 
@@ -90,7 +92,9 @@ python -u scripts/run_qit_merlin.py \
     --n_val       "${N_VAL}"       \
     --patience    "${PATIENCE}"    \
     --output_dir  "${OUTPUT_DIR}"  \
+    --freeze_layers "${FREEZE_LAYERS}"          \
     ${TARGET_SHAPE:+--target_shape $TARGET_SHAPE} \
+    ${FREEZE_BN:+--freeze_bn}                     \
     ${EVAL_ONLY:+--eval_only}
 
 echo "=== done ===" && date

@@ -28,7 +28,8 @@ WEIGHT_GRAN="${WEIGHT_GRAN:-per_channel}"
 FP_LOSS_WEIGHT="${FP_LOSS_WEIGHT:-0.0}"
 REG_WEIGHT="${REG_WEIGHT:-0.0}"
 FREEZE_BN="${FREEZE_BN:-}"        # set to 1 to freeze BatchNorm during training (see --freeze_bn)
-LOG_LAYER_CKA="${LOG_LAYER_CKA:-}" # set to 1 to log per-layer CKA to results.json each epoch
+LOG_LAYER_CKA="${LOG_LAYER_CKA:-}"       # set to 1 to log per-layer CKA to results.json each epoch
+CKA_N_BATCHES="${CKA_N_BATCHES:-1}"     # number of val batches to use as CKA probe (more = more stable)
 BATCH_SIZE="${BATCH_SIZE:-16}"
 W_BITS_MIN="${W_BITS_MIN:-2}"
 W_BITS_MAX="${W_BITS_MAX:-8}"
@@ -81,7 +82,8 @@ python scripts/run_qit.py \
     --output_dir          "${OUTPUT_DIR}"      \
     ${DATA_DIR_FLAG}                           \
     ${FREEZE_BN:+--freeze_bn}          \
-    ${LOG_LAYER_CKA:+--log_layer_cka}
+    ${LOG_LAYER_CKA:+--log_layer_cka}      \
+    ${LOG_LAYER_CKA:+--cka_n_batches "${CKA_N_BATCHES}"}
 
 
 echo "=== comparison plot ===" && date

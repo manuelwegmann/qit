@@ -24,8 +24,11 @@ Override with --data_dir, --reports, --labels, --metadata as needed.
 """
 
 import argparse
+import itertools
 import json
 import sys
+import warnings
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +50,8 @@ from downstream.dataset import MerlinDataset
 # ---------------------------------------------------------------------------
 # Default data paths (relative to project root)
 # ---------------------------------------------------------------------------
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 _CT_DATA = _ROOT.parent / "CT-CLIP" / "data"
 _DEFAULT_DATA_DIR = str(_CT_DATA / "merlin_data")
@@ -131,7 +136,7 @@ def _fp_forward(model: nn.Module, x: torch.Tensor, use_amp: bool,
 def cache_teacher_features(teacher: MerlinEncoder, loader: DataLoader,
                             device: torch.device, use_amp: bool,
                             amp_dtype: torch.dtype = torch.float16) -> dict:
-    """Cache teacher (FP) features for all indexed training samples."""
+    """Compute teacher (FP) features for all indexed samples in loader."""
     teacher.eval()
     cache = {}
     for batch in _pbar(loader, desc="caching teacher features"):
@@ -142,23 +147,54 @@ def cache_teacher_features(teacher: MerlinEncoder, loader: DataLoader,
     return cache
 
 
+def load_or_compute_teacher_cache(teacher, loader, device, use_amp, amp_dtype,
+                                   cache_dir: Path, split: str,
+                                   n_samples: int, target_shape) -> dict:
+    """Load teacher feature cache from disk if available, otherwise compute and save it.
+
+    Cache files are keyed by split, sample count and volume shape so different
+    experimental configs that share these parameters reuse the same cache.
+    """
+    shape_str = "x".join(map(str, target_shape)) if target_shape else "native"
+    cache_path = cache_dir / f"teacher_{split}_n{n_samples}_{shape_str}.pt"
+
+    if cache_path.exists():
+        print(f"  {split}: loading cached features from {cache_path}")
+        return torch.load(cache_path, map_location="cpu", weights_only=True)
+
+    print(f"  {split}: computing features (will save to {cache_path})...")
+    cache = cache_teacher_features(teacher, loader, device, use_amp, amp_dtype)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(cache, cache_path)
+    print(f"  {split}: saved ({len(cache)} samples, {len(cache) * 2048 * 4 / 1e6:.1f} MB)")
+    return cache
+
+
 # ---------------------------------------------------------------------------
 # Train / validate one epoch
 # ---------------------------------------------------------------------------
 
 def train_epoch(student, teacher_cache, loader, optimizer, scheduler,
-                w_bits_range, a_bits_range, device, use_amp, amp_dtype, grad_accum, scaler):
+                w_bits_range, a_bits_range, device, use_amp, amp_dtype, grad_accum, scaler,
+                freeze_bn=False, needs_input_grad=False):
     student.train()
-    # Re-freeze BN after .train() — .train() re-enables BN update mode on all submodules
-    for m in student.modules():
-        if isinstance(m, nn.modules.batchnorm._BatchNorm):
-            m.eval()
+    if freeze_bn:
+        # .train() re-enables BN update mode on all submodules; re-freeze immediately.
+        for m in student.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
     total_loss = n_samples = step = 0
     optimizer.zero_grad()
 
     for batch in loader:
         idx, x, _ = batch[0], batch[1], batch[2]
         x = x.to(device)
+        if needs_input_grad:
+            # Gradient checkpointing (use_reentrant=True) only builds the autograd
+            # graph when at least one input requires grad. With frozen early layers,
+            # x has no grad — marking it here ensures the graph is built for the
+            # trainable later layers. The grad wrt x is computed but never used.
+            x = x.requires_grad_(True)
         w_bits, a_bits = sample_bits(w_bits_range, a_bits_range)
 
         if use_amp:
@@ -204,38 +240,40 @@ def train_epoch(student, teacher_cache, loader, optimizer, scheduler,
 
 
 @torch.no_grad()
-def validate_epoch(student, teacher, val_loader, device, use_amp, amp_dtype, val_configs):
-    """Deterministic validation cycling through val_configs.
+def validate_epoch(student, teacher_val_cache, val_loader, device, use_amp, amp_dtype, val_quant_configs):
+    """Deterministic validation cycling through val_quant_configs.
 
-    For each batch, a config from val_configs is selected by index (round-robin), so
-    over a full pass every config is exercised roughly equally regardless of val-set size.
+    val_quant_configs is a list of (w_bits, a_bits) int tuples covering the full
+    bit-width grid.  Each batch is assigned a config by round-robin so every config
+    is exercised roughly equally regardless of val-set size.  No fp config is included:
+    the val_loss is a pure measure of quantized robustness, avoiding the near-zero fp
+    contribution that would dilute and destabilise the metric.
+
+    Teacher features are read from teacher_val_cache (pre-computed once at startup)
+    rather than recomputed each epoch.
 
     Returns (mean_qit_loss, mean_fp_sim) where:
-      - mean_qit_loss  : mean cosine distance between student (at cycled quant config) and teacher FP
-      - mean_fp_sim    : mean cosine similarity between student FP features and teacher FP features
+      - mean_qit_loss : mean cosine distance between student (at cycled quant config) and teacher FP
+      - mean_fp_sim   : mean cosine similarity between student FP features and teacher FP features
     """
     student.eval()
-    teacher.eval()
     total_qit_loss = total_fp_sim = n_batches = 0
 
     for i, batch in enumerate(val_loader):
-        _, x, _ = batch[0], batch[1], batch[2]
-        x = x.to(device)
-        _, w_bits, a_bits = val_configs[i % len(val_configs)]
+        idx, x, _ = batch[0], batch[1], batch[2]
+        x   = x.to(device)
+        t_f = torch.stack([teacher_val_cache[i] for i in idx.tolist()]).to(device)
+        w_bits, a_bits = val_quant_configs[i % len(val_quant_configs)]
 
-        t_f  = _fp_forward(teacher, x, use_amp, amp_dtype)
-        s_fp = _fp_forward(student,  x, use_amp, amp_dtype)
+        s_fp = _fp_forward(student, x, use_amp, amp_dtype)
 
-        if w_bits is not None:
-            if use_amp:
-                with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
-                        s_q = student(x)
-            else:
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
                 with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
                     s_q = student(x)
         else:
-            s_q = s_fp
+            with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
+                s_q = student(x)
 
         total_qit_loss += _qit_loss(s_q, t_f).item()
         total_fp_sim   += F.cosine_similarity(
@@ -366,8 +404,11 @@ def main():
     parser.add_argument("--metadata",    default=_DEFAULT_METADATA,
                         help="CSV with per-scan spacing metadata (optional, improves preprocessing).")
     parser.add_argument("--patience",    type=int, default=10,
-                        help="Early stopping: stop if val QIT loss does not improve for "
+                        help="Early stopping: stop if moving-avg val loss does not improve for "
                              "this many validation checks. 0 = disabled.")
+    parser.add_argument("--val_window",  type=int, default=3,
+                        help="Window size for moving-average val loss used in early stopping "
+                             "and best-checkpoint selection. Matches run_qit.py behaviour.")
     parser.add_argument("--n_train",     type=int, default=None,
                         help="Cap training set size (random subset, seed=42). "
                              "Default: use full split.")
@@ -395,9 +436,22 @@ def main():
     # System
     parser.add_argument("--num_workers",          type=int,   default=4)
     parser.add_argument("--output_dir",            default=None)
+    parser.add_argument("--teacher_cache_dir",      default=None,
+                        help="Directory for persistent teacher feature caches. "
+                             "Defaults to <data_dir>/teacher_cache. "
+                             "Shared across runs with the same data config.")
     parser.add_argument("--eval_only",             action="store_true",
                         help="Skip training and run test evaluation only. "
                              "Requires checkpoint_best.pt to exist in --output_dir.")
+    parser.add_argument("--freeze_layers",           type=int, default=0,
+                        choices=[0, 1, 2, 3, 4],
+                        help="Freeze the first N layer groups of I3ResNet for gradient updates "
+                             "(0=none, 1=stem, 2=+layer1, 3=+layer2, 4=+layer3). "
+                             "Frozen layers are still quantized during forward passes.")
+    parser.add_argument("--freeze_bn",              action="store_true",
+                        help="Freeze BatchNorm layers throughout training. Off by default — "
+                             "empirically causes divergence on Merlin (ImageNet 2D stats "
+                             "don't hold under QIT on 3D CT data).")
     parser.add_argument("--no_amp",                action="store_true")
     parser.add_argument("--amp_dtype",  default="fp16", choices=["fp16", "bf16"],
                         help="AMP dtype. fp16 matches the original Merlin training; "
@@ -426,8 +480,14 @@ def main():
     print(f"  data_dir  : {args.data_dir}")
     print(f"  epochs    : {args.epochs}  lr={args.lr}  bs={args.batch_size}"
           f"  grad_accum={args.grad_accum}")
-    _cfg_str = ", ".join(n for n, *_ in _EVAL_CONFIGS)
-    print(f"  val_every : {args.val_every}  val_configs=[{_cfg_str}] (cycled deterministically)")
+    _val_quant_configs = list(itertools.product(
+        range(args.w_bits_min, args.w_bits_max + 1),
+        range(args.a_bits_min, args.a_bits_max + 1),
+    ))
+    print(f"  val_every : {args.val_every}  val_configs=full integer grid "
+          f"w=[{args.w_bits_min},{args.w_bits_max}] a=[{args.a_bits_min},{args.a_bits_max}] "
+          f"({len(_val_quant_configs)} configs, cycled deterministically)")
+    print(f"  val_window: {args.val_window} epochs (moving-avg for early stopping)")
     print(f"  amp       : {use_amp} ({args.amp_dtype})")
     _shape_str = "×".join(map(str, args.target_shape)) if args.target_shape else "native (240×480×480)"
     print(f"  vol_shape : {_shape_str}")
@@ -477,26 +537,51 @@ def main():
         p.requires_grad_(False)
 
     student = MerlinEncoder().to(device)
-    # Freeze BatchNorm: prevents (1) running-stat corruption from the double-update
-    # caused by gradient checkpointing recompute, and (2) small-batch degeneracy.
-    # Pre-trained stats from Merlin are already well-calibrated.
-    _bn_count = 0
-    for m in student.modules():
-        if isinstance(m, nn.modules.batchnorm._BatchNorm):
-            m.eval()
-            m.weight.requires_grad_(False)
-            m.bias.requires_grad_(False)
-            _bn_count += 1
 
-    print(f"  encoder params: {sum(p.numel() for p in student.image_encoder.parameters()):,}")
-    print(f"  BatchNorm layers frozen: {_bn_count} (running stats fixed, no grad-checkpoint double-update)")
+    # Partial layer freezing: gradients only — frozen layers are still quantized.
+    # Segments in order: stem (conv1+bn1), layer1, layer2, layer3, layer4.
+    _I3_SEGMENTS = ["stem", "layer1", "layer2", "layer3", "layer4"]
+    _frozen_params = 0
+    if args.freeze_layers > 0:
+        i3 = student.image_encoder.i3_resnet
+        segments_to_freeze = _I3_SEGMENTS[:args.freeze_layers]
+        for seg in segments_to_freeze:
+            if seg == "stem":
+                modules = [i3.conv1, i3.bn1]
+            else:
+                modules = [getattr(i3, seg)]
+            for mod in modules:
+                for p in mod.parameters():
+                    p.requires_grad_(False)
+                    _frozen_params += p.numel()
+
+    _bn_count = 0
+    if args.freeze_bn:
+        for m in student.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
+                m.weight.requires_grad_(False)
+                m.bias.requires_grad_(False)
+                _bn_count += 1
+
+    _total_params   = sum(p.numel() for p in student.image_encoder.parameters())
+    _trainable_params = sum(p.numel() for p in student.image_encoder.parameters() if p.requires_grad)
+    print(f"  encoder params: {_total_params:,}  trainable: {_trainable_params:,}"
+          + (f"  ({_frozen_params:,} frozen via --freeze_layers {args.freeze_layers})" if args.freeze_layers > 0 else ""))
+    print(f"  BatchNorm layers frozen: {_bn_count}")
     print("  gradient checkpointing: always-on (built into I3ResNet)")
 
     # ── cache teacher features ────────────────────────────────────────────
-    print("\nCaching teacher features for training set...")
+    cache_dir = Path(args.teacher_cache_dir or args.data_dir) / "teacher_cache"
+    print("\nTeacher feature cache...")
     if not args.eval_only:
-        teacher_cache = cache_teacher_features(teacher, train_loader, device, use_amp, amp_dtype)
-        print(f"  cached {len(teacher_cache)} samples ({len(teacher_cache) * 2048 * 4 / 1e6:.1f} MB)\n")
+        teacher_cache = load_or_compute_teacher_cache(
+            teacher, train_loader, device, use_amp, amp_dtype,
+            cache_dir, "train", len(train_ds), args.target_shape)
+    teacher_val_cache = load_or_compute_teacher_cache(
+        teacher, val_loader, device, use_amp, amp_dtype,
+        cache_dir, "val", len(val_ds), args.target_shape)
+    print()
 
     # ── optimizer / scheduler / scaler ───────────────────────────────────
     if not args.eval_only:
@@ -512,39 +597,51 @@ def main():
         print("\n[eval_only] Skipping training — loading checkpoint_best.pt")
     else:
         print(f"\n{'Training':=^70}")
-        print(f"{'Epoch':>6}  {'train_loss':>12}  {'val_loss':>10}  {'val_fp_sim':>12}")
+        print(f"{'Epoch':>6}  {'train_loss':>12}  {'val_loss':>10}  {'val_avg':>10}  {'val_fp_sim':>12}")
 
     epoch_log      = []
-    best_val_loss  = float("inf")
+    best_avg_val   = float("inf")
     best_val_epoch = 0
     no_improve     = 0
+    val_history    = deque(maxlen=args.val_window)
 
     for epoch in range(1, args.epochs + 1) if not args.eval_only else []:
         tr_loss = train_epoch(
             student, teacher_cache, train_loader, optimizer, scheduler,
             (args.w_bits_min, args.w_bits_max), (args.a_bits_min, args.a_bits_max),
             device, use_amp, amp_dtype, args.grad_accum, scaler,
+            freeze_bn=args.freeze_bn,
+            needs_input_grad=args.freeze_layers > 0,
         )
+        if tr_loss != tr_loss:  # NaN check
+            print(f"\n[abort] train_loss is NaN at epoch {epoch} — "
+                  f"likely fp16 overflow or frozen-BN mismatch. "
+                  f"Try --amp_dtype bf16 or remove --freeze_bn.")
+            sys.exit(1)
 
-        val_loss = val_fp_sim = None
+        val_loss = val_fp_sim = avg_val = None
         saved    = ""
         if epoch % args.val_every == 0 or epoch == args.epochs:
             val_loss, val_fp_sim = validate_epoch(
-                student, teacher, val_loader, device, use_amp, amp_dtype, _EVAL_CONFIGS)
-            if val_loss < best_val_loss:
-                best_val_loss  = val_loss
+                student, teacher_val_cache, val_loader, device, use_amp, amp_dtype, _val_quant_configs)
+            val_history.append(val_loss)
+            window_full = len(val_history) == args.val_window
+            avg_val     = sum(val_history) / len(val_history)
+            if window_full and avg_val < best_avg_val:
+                best_avg_val   = avg_val
                 best_val_epoch = epoch
                 no_improve     = 0
                 torch.save({"epoch": epoch, "student": student.state_dict()},
                            out / "checkpoint_best.pt")
                 saved = "*"
-            else:
+            elif window_full:
                 no_improve += 1
 
         val_str    = f"{val_loss:10.6f}"   if val_loss    is not None else f"{'—':>10}"
+        avg_str    = f"{avg_val:10.6f}"    if avg_val     is not None else f"{'—':>10}"
         fp_sim_str = f"{val_fp_sim:12.4f}" if val_fp_sim  is not None else f"{'—':>12}"
         marker     = " *" if saved else ""
-        print(f"{epoch:6d}  {tr_loss:12.6f}  {val_str}  {fp_sim_str}{marker}", flush=True)
+        print(f"{epoch:6d}  {tr_loss:12.6f}  {val_str}  {avg_str}  {fp_sim_str}{marker}", flush=True)
 
         epoch_log.append({
             "epoch":      epoch,
@@ -608,8 +705,9 @@ def main():
         "n_test":        len(test_ds),
         "label_names":   label_names,
         "patience":       args.patience,
+        "val_window":     args.val_window,
         "best_val_epoch": best_val_epoch,
-        "best_val_loss":  round(best_val_loss, 7),
+        "best_avg_val":   round(best_avg_val, 7) if best_avg_val < float("inf") else None,
         "auroc":          auroc_results,
         "epoch_log":      epoch_log,
     }

@@ -348,9 +348,12 @@ def main():
     parser.add_argument("--log_layer_cka", action="store_true",
                         help="After each validation step, compute linear CKA between "
                              "student (FP) and teacher at ~4 key layers and log to "
-                             "results.json. Uses the first val batch as a probe — "
-                             "overhead is one extra forward pass per epoch (<1 s). "
-                             "Default: off.")
+                             "results.json. Default: off.")
+    parser.add_argument("--cka_n_batches", type=int, default=1,
+                        help="Number of consecutive val batches to use as the CKA probe. "
+                             "More batches give a more stable estimate at the cost of "
+                             "one extra forward pass per additional batch (~1 s each). "
+                             "Default: 1 (single batch, fast but noisy for deep layers).")
     parser.add_argument("--freeze_bn",    action="store_true",
                         help="Freeze BatchNorm layers throughout training (eval mode, "
                              "no grad on scale/bias). Recommended for CNN backbones on "
@@ -523,13 +526,18 @@ def main():
         elif window_full:
             epochs_no_improve += 1
 
-        # Optional layer-wise CKA: one extra FP forward pass on a single probe
-        # batch — overhead is negligible (<1 s per epoch).
+        # Optional layer-wise CKA: FP forward pass on cka_n_batches consecutive
+        # val batches. More batches → more stable estimate, ~1 s overhead each.
         layer_cka = {}
         if args.log_layer_cka:
-            probe_x, _, _ = next(iter(val_loader))
+            chunks = []
+            for i, (bx, _, _) in enumerate(val_loader):
+                chunks.append(bx)
+                if i + 1 >= args.cka_n_batches:
+                    break
+            probe_x = torch.cat(chunks, dim=0).to(device)
             layer_cka = compute_layer_cka(
-                teacher, student, probe_x.to(device), args.backbone)
+                teacher, student, probe_x, args.backbone)
 
         marker = f" *best* (avg={avg_val:.4f})" if is_best else (
                  f" (avg={avg_val:.4f})" if window_full else "")

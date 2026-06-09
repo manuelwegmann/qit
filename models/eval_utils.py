@@ -58,6 +58,8 @@ _TRANSFORM = transforms.Compose([
 # ---------------------------------------------------------------------------
 
 def _pbar(iterable, **kwargs):
+    if not sys.stderr.isatty():
+        kwargs["disable"] = True
     n = len(iterable) if hasattr(iterable, "__len__") else None
     extra = {"miniters": max(1, n // 20), "mininterval": 0} if n else {"mininterval": 30}
     return tqdm.tqdm(iterable, **extra, **kwargs)

@@ -23,6 +23,13 @@ _BACKBONES = [
     ("swin_t",             "Swin-T"),
 ]
 
+# Backbone keys that should be read from a non-default run directory.
+# Default dir: qit_cifar10_<backbone_key>
+_RUN_DIR_OVERRIDE = {
+    "resnet18":        "qit_cifar10_resnet18_freeze_bn",
+    "efficientnet_b0": "qit_cifar10_efficientnet_b0_freeze_bn",
+}
+
 _CONFIG_LABELS = {
     "fp":   "FP",
     "w8a8": "W8A8",
@@ -98,7 +105,8 @@ def main():
     axes_flat = axes.flatten()
 
     for i, (backbone_key, backbone_label) in enumerate(_BACKBONES):
-        results_path = runs_dir / f"qit_cifar10_{backbone_key}" / "results.json"
+        run_dir_name = _RUN_DIR_OVERRIDE.get(backbone_key, f"qit_cifar10_{backbone_key}")
+        results_path = runs_dir / run_dir_name / "results.json"
         with open(results_path) as f:
             data = json.load(f)
         plot_backbone(axes_flat[i], data["results"]["probe"],
