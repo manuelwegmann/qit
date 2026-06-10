@@ -147,26 +147,74 @@ def cache_teacher_features(teacher: MerlinEncoder, loader: DataLoader,
     return cache
 
 
+def _unwrap_subset_indices(ds):
+    """If ds is a (possibly _ResizedDataset-wrapped) torch.utils.data.Subset,
+    return its .indices into the underlying full-split dataset; else None."""
+    if isinstance(ds, _ResizedDataset):
+        ds = ds._ds
+    if isinstance(ds, torch.utils.data.Subset):
+        return list(ds.indices)
+    return None
+
+
+def _get_labels(ds) -> np.ndarray:
+    """Return the (N, n_cond) label array for a (possibly wrapped) MerlinDataset,
+    reading directly from .samples — no volume I/O or model forward pass."""
+    if isinstance(ds, _ResizedDataset):
+        ds = ds._ds
+    if isinstance(ds, torch.utils.data.Subset):
+        return np.stack([ds.dataset.samples[i][1] for i in ds.indices])
+    return np.stack([s[1] for s in ds.samples])
+
+
 def load_or_compute_teacher_cache(teacher, loader, device, use_amp, amp_dtype,
                                    cache_dir: Path, split: str,
-                                   n_samples: int, target_shape) -> dict:
+                                   n_samples: int, target_shape,
+                                   full_cache_dir: Path = None,
+                                   subset_indices=None) -> dict:
     """Load teacher feature cache from disk if available, otherwise compute and save it.
 
     Cache files are keyed by split, sample count and volume shape so different
     experimental configs that share these parameters reuse the same cache.
+
+    If full_cache_dir is given and contains a full-split cache (e.g. produced by
+    run_qit_merlin_fulldata.py, keyed by original dataset index), derive this
+    run's cache from it instead of recomputing — remapping via subset_indices
+    when this run uses a subsampled split.
     """
     shape_str = "x".join(map(str, target_shape)) if target_shape else "native"
     cache_path = cache_dir / f"teacher_{split}_n{n_samples}_{shape_str}.pt"
 
     if cache_path.exists():
-        print(f"  {split}: loading cached features from {cache_path}")
-        return torch.load(cache_path, map_location="cpu", weights_only=True)
+        print(f"  {split}: loading cached features from {cache_path}", flush=True)
+        cache = torch.load(cache_path, map_location="cpu", weights_only=True)
+        print(f"  {split}: loaded {len(cache)} cached features", flush=True)
+        return cache
 
-    print(f"  {split}: computing features (will save to {cache_path})...")
+    if full_cache_dir is not None:
+        full_matches = list(full_cache_dir.glob(f"{split}_n*_{shape_str}.pt"))
+        if full_matches:
+            full_path  = max(full_matches, key=lambda p: int(p.stem.split("_n")[1].split("_")[0]))
+            full_cache = torch.load(full_path, map_location="cpu", weights_only=True)
+            if subset_indices is not None:
+                cache = {i: full_cache[orig_i] for i, orig_i in enumerate(subset_indices)}
+            elif len(full_cache) == n_samples:
+                cache = full_cache
+            else:
+                cache = None
+            if cache is not None:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(cache, cache_path)
+                print(f"  {split}: derived {len(cache)} samples from {full_path}", flush=True)
+                return cache
+
+    print(f"  {split}: computing teacher features ({n_samples} samples, "
+          f"will save to {cache_path})...", flush=True)
     cache = cache_teacher_features(teacher, loader, device, use_amp, amp_dtype)
     cache_dir.mkdir(parents=True, exist_ok=True)
     torch.save(cache, cache_path)
-    print(f"  {split}: saved ({len(cache)} samples, {len(cache) * 2048 * 4 / 1e6:.1f} MB)")
+    print(f"  {split}: computing teacher features done "
+          f"({len(cache)} samples, {len(cache) * 2048 * 4 / 1e6:.1f} MB)", flush=True)
     return cache
 
 
@@ -321,8 +369,11 @@ def extract_features(model, loader, device, use_amp, amp_dtype,
 
 
 def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
-                    label_names, device, epochs=300, lr=1e-3, batch_size=256):
+                    label_names, device, epochs=300, lr=1e-3, batch_size=256, n_seeds=5):
     """Masked-BCE linear probe for multi-label AUROC.
+
+    Trains n_seeds independently-initialised probes (different init + shuffle)
+    and averages AUROC across seeds for a more robust estimate on small test sets.
 
     Labels: 1=positive, 0=negative, -1=unknown (masked out during training).
     Returns (mean_auroc, per_condition_auroc_dict).
@@ -340,52 +391,67 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
     X_te = (X_te - mu) / std
 
     n_cond = y_tr.shape[1]
-    head   = nn.Linear(X_tr.shape[1], n_cond).to(device)
-    opt    = torch.optim.Adam(head.parameters(), lr=lr)
-    sch    = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=0)
 
-    ds     = torch.utils.data.TensorDataset(X_tr.to(device), y_tr.to(device), m_tr.to(device))
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+    valid_conds = [
+        c for c in range(n_cond)
+        if (test_labels[:, c] >= 0).sum() >= 10
+        and np.ptp(test_labels[test_labels[:, c] >= 0, c]) > 0
+    ]
 
-    best_loss, no_imp = float("inf"), 0
-    for _ in range(epochs):
-        head.train()
-        ep_loss = 0.0
-        for xb, yb, mb in loader:
-            opt.zero_grad()
-            raw  = F.binary_cross_entropy_with_logits(head(xb), yb, reduction="none")
-            loss = (raw * mb).sum() / mb.sum().clamp(min=1)
-            loss.backward()
-            opt.step()
-            ep_loss += loss.item()
-        sch.step()
-        ep_loss /= len(loader)
-        if best_loss - ep_loss > 1e-5:
-            best_loss, no_imp = ep_loss, 0
+    per_cond_runs = {label_names[c]: [] for c in valid_conds}
+    mean_aucs = []
+
+    for seed in range(n_seeds):
+        torch.manual_seed(seed)
+        head   = nn.Linear(X_tr.shape[1], n_cond).to(device)
+        opt    = torch.optim.Adam(head.parameters(), lr=lr)
+        sch    = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=0)
+
+        ds     = torch.utils.data.TensorDataset(X_tr.to(device), y_tr.to(device), m_tr.to(device))
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+        best_loss, no_imp = float("inf"), 0
+        for _ in range(epochs):
+            head.train()
+            ep_loss = 0.0
+            for xb, yb, mb in loader:
+                opt.zero_grad()
+                raw  = F.binary_cross_entropy_with_logits(head(xb), yb, reduction="none")
+                loss = (raw * mb).sum() / mb.sum().clamp(min=1)
+                loss.backward()
+                opt.step()
+                ep_loss += loss.item()
+            sch.step()
+            ep_loss /= len(loader)
+            if best_loss - ep_loss > 1e-5:
+                best_loss, no_imp = ep_loss, 0
+            else:
+                no_imp += 1
+            if no_imp >= 30:
+                break
+
+        head.eval()
+        with torch.no_grad():
+            preds = torch.sigmoid(head(X_te.to(device))).cpu().numpy()
+
+        seed_aucs = []
+        for c in valid_conds:
+            mask = test_labels[:, c] >= 0
+            try:
+                auc = float(roc_auc_score(test_labels[mask, c], preds[mask, c]))
+                per_cond_runs[label_names[c]].append(auc)
+                seed_aucs.append(auc)
+            except Exception:
+                pass
+        if seed_aucs:
+            seed_mean = float(np.mean(seed_aucs))
+            mean_aucs.append(seed_mean)
+            print(f"      probe seed {seed + 1}/{n_seeds} done (auc={seed_mean:.4f})", flush=True)
         else:
-            no_imp += 1
-        if no_imp >= 30:
-            break
+            print(f"      probe seed {seed + 1}/{n_seeds} done (no valid conditions)", flush=True)
 
-    head.eval()
-    with torch.no_grad():
-        preds = torch.sigmoid(head(X_te.to(device))).cpu().numpy()
-
-    per_cond = {}
-    for c, name in enumerate(label_names):
-        mask = test_labels[:, c] >= 0
-        if mask.sum() < 10:
-            continue
-        y_true = test_labels[mask, c]
-        y_pred = preds[mask, c]
-        if y_true.max() == y_true.min():
-            continue
-        try:
-            per_cond[name] = float(roc_auc_score(y_true, y_pred))
-        except Exception:
-            pass
-
-    mean_auroc = float(np.mean(list(per_cond.values()))) if per_cond else float("nan")
+    per_cond   = {name: float(np.mean(vals)) for name, vals in per_cond_runs.items() if vals}
+    mean_auroc = float(np.mean(mean_aucs)) if mean_aucs else float("nan")
     return mean_auroc, per_cond
 
 
@@ -529,6 +595,10 @@ def main():
                               shuffle=False, num_workers=min(2, args.num_workers),
                               pin_memory=pin,
                               persistent_workers=args.num_workers > 0)
+    test_cache_loader = DataLoader(_IndexedDataset(test_ds), batch_size=args.batch_size,
+                              shuffle=False, num_workers=min(2, args.num_workers),
+                              pin_memory=pin,
+                              persistent_workers=args.num_workers > 0)
 
     # ── models ────────────────────────────────────────────────────────────
     print("Loading Merlin models (teacher + student)...")
@@ -572,15 +642,23 @@ def main():
     print("  gradient checkpointing: always-on (built into I3ResNet)")
 
     # ── cache teacher features ────────────────────────────────────────────
-    cache_dir = Path(args.teacher_cache_dir or args.data_dir) / "teacher_cache"
+    # train and test caches are also reused below for the teacher's "fp"
+    # AUROC probe, avoiding a second full forward pass over the teacher.
+    cache_dir      = Path(args.teacher_cache_dir or args.data_dir) / "teacher_cache"
+    full_cache_dir = Path(args.data_dir) / "teacher_features_all"
     print("\nTeacher feature cache...")
-    if not args.eval_only:
-        teacher_cache = load_or_compute_teacher_cache(
-            teacher, train_loader, device, use_amp, amp_dtype,
-            cache_dir, "train", len(train_ds), args.target_shape)
+    teacher_cache = load_or_compute_teacher_cache(
+        teacher, train_loader, device, use_amp, amp_dtype,
+        cache_dir, "train", len(train_ds), args.target_shape,
+        full_cache_dir=full_cache_dir, subset_indices=_unwrap_subset_indices(train_ds))
     teacher_val_cache = load_or_compute_teacher_cache(
         teacher, val_loader, device, use_amp, amp_dtype,
-        cache_dir, "val", len(val_ds), args.target_shape)
+        cache_dir, "val", len(val_ds), args.target_shape,
+        full_cache_dir=full_cache_dir, subset_indices=_unwrap_subset_indices(val_ds))
+    teacher_test_cache = load_or_compute_teacher_cache(
+        teacher, test_cache_loader, device, use_amp, amp_dtype,
+        cache_dir, "test", len(test_ds), args.target_shape,
+        full_cache_dir=full_cache_dir, subset_indices=_unwrap_subset_indices(test_ds))
     print()
 
     # ── optimizer / scheduler / scaler ───────────────────────────────────
@@ -675,18 +753,37 @@ def main():
 
     # Student at every quant config
     for cfg_name, wb, ab in _EVAL_CONFIGS:
-        print(f"\n  [student {cfg_name}] extracting features...")
+        print(f"\n  [student {cfg_name}] computing train features...", flush=True)
         tr_f, tr_l = extract_features(student, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
+        print(f"  [student {cfg_name}] train features done ({len(tr_f)} samples)", flush=True)
+        print(f"  [student {cfg_name}] computing test features...", flush=True)
         te_f, te_l = extract_features(student, test_loader,       device, use_amp, amp_dtype, wb, ab)
+        print(f"  [student {cfg_name}] test features done ({len(te_f)} samples)", flush=True)
+        print(f"  [student {cfg_name}] fitting probes...", flush=True)
         mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
         auroc_results[f"student_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
         print(f"    mean AUROC = {mean_auc:.4f}")
 
     # Teacher at every quant config (direct comparison baseline)
+    train_labels = _get_labels(train_ds)
+    test_labels  = _get_labels(test_ds)
     for cfg_name, wb, ab in _EVAL_CONFIGS:
-        print(f"\n  [teacher {cfg_name}] extracting features...")
-        tr_f, tr_l = extract_features(teacher, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
-        te_f, te_l = extract_features(teacher, test_loader,       device, use_amp, amp_dtype, wb, ab)
+        if wb is None:
+            # FP features are already cached — reuse instead of a second
+            # forward pass over the full teacher model.
+            tr_f = torch.stack([teacher_cache[i]      for i in range(len(train_ds))]).numpy()
+            te_f = torch.stack([teacher_test_cache[i] for i in range(len(test_ds))]).numpy()
+            tr_l, te_l = train_labels, test_labels
+            print(f"\n  [teacher {cfg_name}] using cached FP features "
+                  f"(train={len(tr_f)}, test={len(te_f)})", flush=True)
+        else:
+            print(f"\n  [teacher {cfg_name}] computing train features...", flush=True)
+            tr_f, tr_l = extract_features(teacher, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
+            print(f"  [teacher {cfg_name}] train features done ({len(tr_f)} samples)", flush=True)
+            print(f"  [teacher {cfg_name}] computing test features...", flush=True)
+            te_f, te_l = extract_features(teacher, test_loader,       device, use_amp, amp_dtype, wb, ab)
+            print(f"  [teacher {cfg_name}] test features done ({len(te_f)} samples)", flush=True)
+        print(f"  [teacher {cfg_name}] fitting probes...", flush=True)
         mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
         auroc_results[f"teacher_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
         print(f"    mean AUROC = {mean_auc:.4f}")
