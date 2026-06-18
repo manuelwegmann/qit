@@ -110,7 +110,7 @@ def main():
     teacher_patch = mpatches.Patch(color=_TEACHER_COLOR, label="Teacher (PTQ baseline)")
     student_patch = mpatches.Patch(color=_STUDENT_COLOR, label="Student (QIT-trained)")
     ax.legend(handles=[teacher_patch, student_patch], fontsize=10,
-              loc="lower left")
+              loc="upper left", bbox_to_anchor=(1.01, 1.0), frameon=False)
 
     dataset  = data.get("dataset", "")
     backbone = data.get("backbone") or data.get("model", "")

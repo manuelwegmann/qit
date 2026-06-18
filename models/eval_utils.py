@@ -221,27 +221,47 @@ class MerlinEncoder(nn.Module):
 # Linear probe
 # ---------------------------------------------------------------------------
 
+def split_train_val(n: int, val_frac: float = 0.2, seed: int = 0):
+    """Deterministic train/val index split for carving a probe-validation set
+    out of a probe-train feature set (used for run_probe's early stopping)."""
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
+    n_val = max(1, int(n * val_frac))
+    return idx[n_val:], idx[:n_val]
+
+
 def run_probe(
     train_feats: np.ndarray, train_labels: np.ndarray,
+    val_feats:   np.ndarray, val_labels:   np.ndarray,
     test_feats:  np.ndarray, test_labels:  np.ndarray,
     device: torch.device,
     epochs: int = 500, lr: float = 1e-3, batch_size: int = 256,
     n_seeds: int = 3, es_patience: int = 30, es_tol: float = 1e-5,
 ) -> float:
-    """Linear probe: nn.Linear + Adam + cosine LR, averaged over n_seeds."""
-    X_tr = torch.tensor(train_feats, dtype=torch.float32)
-    y_tr = torch.tensor(train_labels, dtype=torch.long)
-    X_te = torch.tensor(test_feats,  dtype=torch.float32)
-    y_te = torch.tensor(test_labels, dtype=torch.long)
+    """Linear probe: nn.Linear + Adam + cosine LR, averaged over n_seeds.
+
+    Early stopping and best-checkpoint selection use held-out val_feats/val_labels
+    (not the training loss) to avoid overfitting the probe head, and the
+    best-val-epoch weights are restored before evaluating accuracy on test_feats.
+    """
+    X_tr  = torch.tensor(train_feats, dtype=torch.float32)
+    y_tr  = torch.tensor(train_labels, dtype=torch.long)
+    X_val = torch.tensor(val_feats, dtype=torch.float32)
+    y_val = torch.tensor(val_labels, dtype=torch.long)
+    X_te  = torch.tensor(test_feats,  dtype=torch.float32)
+    y_te  = torch.tensor(test_labels, dtype=torch.long)
 
     mu  = X_tr.mean(0)
     std = X_tr.std(0).clamp(min=1e-8)
-    X_tr = (X_tr - mu) / std
-    X_te = (X_te - mu) / std
+    X_tr  = (X_tr  - mu) / std
+    X_val = (X_val - mu) / std
+    X_te  = (X_te  - mu) / std
 
     n_classes = int(y_tr.max().item()) + 1
     dataset   = TensorDataset(X_tr.to(device), y_tr.to(device))
     loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    X_val_dev = X_val.to(device)
+    y_val_dev = y_val.to(device)
 
     accs = []
     for seed in range(n_seeds):
@@ -250,25 +270,29 @@ def run_probe(
         opt  = torch.optim.Adam(head.parameters(), lr=lr)
         sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=0)
 
-        best_loss, no_improve = float("inf"), 0
-        head.train()
+        best_val_loss, no_improve = float("inf"), 0
+        best_state = {k: v.clone() for k, v in head.state_dict().items()}
         for _ in range(epochs):
-            epoch_loss = 0.0
+            head.train()
             for xb, yb in loader:
                 opt.zero_grad()
                 loss = F.cross_entropy(head(xb), yb)
                 loss.backward()
                 opt.step()
-                epoch_loss += loss.item()
             sch.step()
-            epoch_loss /= len(loader)
-            if best_loss - epoch_loss > es_tol:
-                best_loss, no_improve = epoch_loss, 0
+
+            head.eval()
+            with torch.no_grad():
+                val_loss = F.cross_entropy(head(X_val_dev), y_val_dev).item()
+            if best_val_loss - val_loss > es_tol:
+                best_val_loss, no_improve = val_loss, 0
+                best_state = {k: v.clone() for k, v in head.state_dict().items()}
             else:
                 no_improve += 1
             if no_improve >= es_patience:
                 break
 
+        head.load_state_dict(best_state)
         head.eval()
         with torch.no_grad():
             preds = head(X_te.to(device)).argmax(1).cpu()

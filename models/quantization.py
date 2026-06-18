@@ -257,11 +257,15 @@ def calibrate_activations(
 
         def _make_hook(k: str):
             def _hook(mod: nn.Module, inp: tuple, out: torch.Tensor) -> None:
-                x = inp[0].detach().float().flatten()
+                x = inp[0].detach().flatten()
                 if len(x) > _MAX_SAMPLES:
-                    idx = torch.randperm(len(x), device=x.device)[:_MAX_SAMPLES]
+                    # randint (fixed-size index tensor) instead of randperm
+                    # (size scales with len(x)) — for 3D conv activations on CT
+                    # volumes, len(x) can exceed 1e9 and randperm's int64 output
+                    # alone would allocate several GB on the GPU.
+                    idx = torch.randint(0, len(x), (_MAX_SAMPLES,), device=x.device)
                     x = x[idx]
-                buffers[k].append(x.cpu())
+                buffers[k].append(x.float().cpu())
             return _hook
 
         hooks.append(lyr.register_forward_hook(_make_hook(key)))

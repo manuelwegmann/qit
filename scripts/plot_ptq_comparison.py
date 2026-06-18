@@ -130,10 +130,12 @@ def main():
                           marker="^", markersize=4, label=f"pct{pct:.4g}"),
         ]
         leg1 = ax.legend(handles=model_patches, fontsize=9,
-                         loc="upper right", title="Model")
+                         loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                         frameon=False, title="Model")
         ax.add_artist(leg1)
         ax.legend(handles=style_patches, fontsize=9,
-                  loc="lower left", title="Calibration")
+                  loc="upper left", bbox_to_anchor=(1.02, 0.55),
+                  frameon=False, title="Calibration")
 
     plt.tight_layout()
 

@@ -6,7 +6,8 @@ evaluates on the test set after a fixed number of epochs.
 
 Compared to run_qit_merlin.py this script is intentionally minimal:
   - no validation, no early stopping, no patience
-  - hardcoded hyperparams (see constants below)
+  - hardcoded hyperparams (see constants below), with --epochs/--w_bits_min/
+    --w_bits_max/--a_bits_min/--a_bits_max as the only CLI overrides
   - teacher features cached under data_dir/teacher_cache/teacher_train_val_n*
 """
 
@@ -149,14 +150,14 @@ def load_or_compute_cache(teacher, loader, device, amp_dtype, cache_path):
 # ---------------------------------------------------------------------------
 
 def train_epoch(student, teacher_cache, loader, optimizer, scheduler,
-                device, amp_dtype, grad_accum, scaler):
+                device, amp_dtype, grad_accum, scaler, w_bits_range, a_bits_range):
     student.train()
     total_loss = n_samples = step = 0
     optimizer.zero_grad()
 
     for idx, x, _ in loader:
         x = x.to(device)
-        w_bits, a_bits = sample_bits((W_BITS_MIN, W_BITS_MAX), (A_BITS_MIN, A_BITS_MAX))
+        w_bits, a_bits = sample_bits(w_bits_range, a_bits_range)
         with torch.amp.autocast("cuda", dtype=amp_dtype):
             with quantized_forward([student.image_encoder], w_bits, a_bits, "per_channel"):
                 s_f = student(x)
@@ -212,21 +213,35 @@ def extract_features(model, loader, device, amp_dtype, w_bits=None, a_bits=None)
     return torch.cat(all_f).numpy(), torch.cat(all_y).numpy()
 
 
-def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
+def run_auroc_probe(train_feats, train_labels, val_feats, val_labels,
+                    test_feats, test_labels,
                     label_names, device, epochs=300, lr=1e-3, batch_size=256, n_seeds=5):
     """Trains n_seeds independently-initialised linear probes and averages
     AUROC across seeds — with only ~750 test scans this reduces variance from
-    a single probe initialisation/shuffle."""
+    a single probe initialisation/shuffle.
+
+    Early stopping and best-checkpoint selection use held-out val_feats/val_labels
+    (not the training loss) to avoid overfitting the probe head, and the
+    best-val-epoch weights are restored before evaluating AUROC on test_feats.
+
+    Returns (mean_auroc, per_condition_auroc_dict, std_auroc, per_condition_std_dict, seed_aucs),
+    where the std values are the across-seed standard deviation (n_seeds=5 by default)
+    and seed_aucs is the list of per-seed mean AUROCs (averaged over conditions).
+    """
     from sklearn.metrics import roc_auc_score
 
-    X_tr = torch.tensor(train_feats, dtype=torch.float32)
-    y_tr = torch.tensor(np.clip(train_labels, 0, 1).astype(np.float32))
-    m_tr = torch.tensor((train_labels >= 0).astype(np.float32))
-    X_te = torch.tensor(test_feats,  dtype=torch.float32)
+    X_tr  = torch.tensor(train_feats, dtype=torch.float32)
+    y_tr  = torch.tensor(np.clip(train_labels, 0, 1).astype(np.float32))
+    m_tr  = torch.tensor((train_labels >= 0).astype(np.float32))
+    X_val = torch.tensor(val_feats, dtype=torch.float32)
+    y_val = torch.tensor(np.clip(val_labels, 0, 1).astype(np.float32))
+    m_val = torch.tensor((val_labels >= 0).astype(np.float32))
+    X_te  = torch.tensor(test_feats,  dtype=torch.float32)
 
     mu, std = X_tr.mean(0), X_tr.std(0).clamp(min=1e-8)
-    X_tr = (X_tr - mu) / std
-    X_te = (X_te - mu) / std
+    X_tr  = (X_tr  - mu) / std
+    X_val = (X_val - mu) / std
+    X_te  = (X_te  - mu) / std
 
     valid_conds = [
         c for c, _ in enumerate(label_names)
@@ -237,6 +252,10 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
     per_cond_runs = {label_names[c]: [] for c in valid_conds}
     mean_aucs = []
 
+    X_val_dev = X_val.to(device)
+    y_val_dev = y_val.to(device)
+    m_val_dev = m_val.to(device)
+
     for seed in range(n_seeds):
         torch.manual_seed(seed)
         head = nn.Linear(X_tr.shape[1], y_tr.shape[1]).to(device)
@@ -245,25 +264,30 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
         ds   = torch.utils.data.TensorDataset(X_tr.to(device), y_tr.to(device), m_tr.to(device))
         dl   = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-        best_loss, no_imp = float("inf"), 0
+        best_val_loss, no_imp = float("inf"), 0
+        best_state = {k: v.clone() for k, v in head.state_dict().items()}
         for _ in range(epochs):
             head.train()
-            ep = 0.0
             for xb, yb, mb in dl:
                 opt.zero_grad()
                 raw  = F.binary_cross_entropy_with_logits(head(xb), yb, reduction="none")
                 loss = (raw * mb).sum() / mb.sum().clamp(min=1)
                 loss.backward(); opt.step()
-                ep += loss.item()
             sch.step()
-            ep /= len(dl)
-            if best_loss - ep > 1e-5:
-                best_loss, no_imp = ep, 0
+
+            head.eval()
+            with torch.no_grad():
+                raw_val  = F.binary_cross_entropy_with_logits(head(X_val_dev), y_val_dev, reduction="none")
+                val_loss = ((raw_val * m_val_dev).sum() / m_val_dev.sum().clamp(min=1)).item()
+            if best_val_loss - val_loss > 1e-5:
+                best_val_loss, no_imp = val_loss, 0
+                best_state = {k: v.clone() for k, v in head.state_dict().items()}
             else:
                 no_imp += 1
             if no_imp >= 30:
                 break
 
+        head.load_state_dict(best_state)
         head.eval()
         with torch.no_grad():
             preds = torch.sigmoid(head(X_te.to(device))).cpu().numpy()
@@ -284,9 +308,11 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
         else:
             print(f"      probe seed {seed + 1}/{n_seeds} done (no valid conditions)", flush=True)
 
-    per_cond = {name: float(np.mean(vals)) for name, vals in per_cond_runs.items() if vals}
-    mean_auc = float(np.mean(mean_aucs)) if mean_aucs else float("nan")
-    return mean_auc, per_cond
+    per_cond     = {name: float(np.mean(vals)) for name, vals in per_cond_runs.items() if vals}
+    per_cond_std = {name: float(np.std(vals))  for name, vals in per_cond_runs.items() if vals}
+    mean_auc     = float(np.mean(mean_aucs)) if mean_aucs else float("nan")
+    std_auc      = float(np.std(mean_aucs))  if mean_aucs else float("nan")
+    return mean_auc, per_cond, std_auc, per_cond_std, mean_aucs
 
 
 # ---------------------------------------------------------------------------
@@ -303,16 +329,26 @@ def main():
     parser.add_argument("--conditions",nargs="+",
                         default=["atelectasis", "pleural_effusion", "renal_cyst"])
     parser.add_argument("--output_dir",default="runs/qit_merlin_fulldata")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Skip training — load checkpoint_final.pt from "
+                             "--output_dir and run the test evaluation only.")
+    parser.add_argument("--epochs",     type=int, default=EPOCHS)
+    parser.add_argument("--w_bits_min", type=int, default=W_BITS_MIN)
+    parser.add_argument("--w_bits_max", type=int, default=W_BITS_MAX)
+    parser.add_argument("--a_bits_min", type=int, default=A_BITS_MIN)
+    parser.add_argument("--a_bits_max", type=int, default=A_BITS_MAX)
     args = parser.parse_args()
 
     device    = torch.device("cuda")
     out       = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     scaler    = torch.amp.GradScaler("cuda") if AMP_DTYPE == torch.float16 else None
+    w_bits_range = (args.w_bits_min, args.w_bits_max)
+    a_bits_range = (args.a_bits_min, args.a_bits_max)
 
     print(f"\n{'QIT — Merlin CT full-data':=^70}")
-    print(f"  train+val → test | epochs={EPOCHS} bs={BATCH_SIZE} ga={GRAD_ACCUM} lr={LR}")
-    print(f"  W{W_BITS_MIN}-{W_BITS_MAX} A{A_BITS_MIN}-{A_BITS_MAX} | amp=bf16")
+    print(f"  train+val → test | epochs={args.epochs} bs={BATCH_SIZE} ga={GRAD_ACCUM} lr={LR}")
+    print(f"  W{args.w_bits_min}-{args.w_bits_max} A{args.a_bits_min}-{args.a_bits_max} | amp=bf16")
     print(f"  output: {out}\n{'='*70}\n")
 
     # ── dataset ───────────────────────────────────────────────────────────
@@ -376,28 +412,38 @@ def main():
         filter(lambda p: p.requires_grad, student.parameters()), lr=LR
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=0
+        optimizer, T_max=args.epochs, eta_min=0
     )
 
-    print(f"\n{'Training':=^70}")
-    print(f"{'Epoch':>6}  {'train_loss':>12}")
-    for epoch in range(1, EPOCHS + 1):
-        loss = train_epoch(student, teacher_cache, train_loader,
-                           optimizer, scheduler, device, AMP_DTYPE, GRAD_ACCUM, scaler)
-        if loss != loss:
-            print(f"\n[abort] NaN loss at epoch {epoch}")
-            sys.exit(1)
-        print(f"{epoch:6d}  {loss:12.6f}", flush=True)
-        torch.save({"epoch": epoch, "student": student.state_dict()},
-                   out / f"checkpoint_epoch{epoch}.pt")
+    if args.eval_only:
+        print("\n[eval_only] Skipping training — loading checkpoint_final.pt")
+        ckpt = torch.load(out / "checkpoint_final.pt", map_location=device)
+        student.load_state_dict(ckpt["student"])
+    else:
+        print(f"\n{'Training':=^70}")
+        print(f"{'Epoch':>6}  {'train_loss':>12}")
+        for epoch in range(1, args.epochs + 1):
+            loss = train_epoch(student, teacher_cache, train_loader,
+                               optimizer, scheduler, device, AMP_DTYPE, GRAD_ACCUM, scaler,
+                               w_bits_range, a_bits_range)
+            if loss != loss:
+                print(f"\n[abort] NaN loss at epoch {epoch}")
+                sys.exit(1)
+            print(f"{epoch:6d}  {loss:12.6f}", flush=True)
+            torch.save({"epoch": epoch, "student": student.state_dict()},
+                       out / f"checkpoint_epoch{epoch}.pt")
 
-    torch.save({"epoch": EPOCHS, "student": student.state_dict()},
-               out / "checkpoint_final.pt")
+        torch.save({"epoch": args.epochs, "student": student.state_dict()},
+                   out / "checkpoint_final.pt")
 
     # ── test evaluation ───────────────────────────────────────────────────
     print(f"\n{'Test evaluation':=^70}")
     eval_kw = dict(batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
-    train_eval_loader = DataLoader(combined,  **eval_kw)
+    # Probe fitting uses train_raw only; val_raw (also part of `combined` during
+    # backbone training, but never seen by the probe head) serves as the probe's
+    # held-out set for early stopping / best-checkpoint selection.
+    train_eval_loader = DataLoader(train_raw, **eval_kw)
+    val_eval_loader   = DataLoader(val_raw,   **eval_kw)
     test_loader       = DataLoader(test_ds,   **eval_kw)
 
     auroc_results = {}
@@ -405,47 +451,67 @@ def main():
         print(f"\n  [student {cfg_name}] computing train features...", flush=True)
         tr_f, tr_l = extract_features(student, train_eval_loader, device, AMP_DTYPE, wb, ab)
         print(f"  [student {cfg_name}] train features done ({len(tr_f)} samples)", flush=True)
+        print(f"  [student {cfg_name}] computing val features...", flush=True)
+        va_f, va_l = extract_features(student, val_eval_loader,   device, AMP_DTYPE, wb, ab)
+        print(f"  [student {cfg_name}] val features done ({len(va_f)} samples)", flush=True)
         print(f"  [student {cfg_name}] computing test features...", flush=True)
         te_f, te_l = extract_features(student, test_loader,       device, AMP_DTYPE, wb, ab)
         print(f"  [student {cfg_name}] test features done ({len(te_f)} samples)", flush=True)
         print(f"  [student {cfg_name}] fitting probes...", flush=True)
-        mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
-        auroc_results[f"student_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
-        print(f"    mean AUROC = {mean_auc:.4f}")
+        mean_auc, per_cond, std_auc, per_cond_std, seed_aucs = run_auroc_probe(tr_f, tr_l, va_f, va_l, te_f, te_l, label_names, device)
+        auroc_results[f"student_{cfg_name}"] = {
+            "mean_auroc": round(mean_auc, 4),
+            "std_auroc": round(std_auc, 4),
+            "per_condition": per_cond,
+            "per_condition_std": {k: round(v, 4) for k, v in per_cond_std.items()},
+            "seed_aucs": [round(v, 4) for v in seed_aucs],
+        }
+        print(f"    mean AUROC = {mean_auc:.4f} ± {std_auc:.4f}")
 
-    train_labels = np.concatenate([_get_labels(train_raw), _get_labels(val_raw)])
+    train_labels = _get_labels(train_raw)
+    val_labels   = _get_labels(val_raw)
     test_labels  = _get_labels(test_ds)
     for cfg_name, wb, ab in _EVAL_CONFIGS:
         if wb is None:
             # FP features were already cached above — reuse instead of a
             # second forward pass over the full teacher model.
-            tr_f = torch.stack([teacher_cache[i] for i in range(N)]).numpy()
-            te_f = torch.stack([test_cache[i]    for i in range(n_te)]).numpy()
-            tr_l, te_l = train_labels, test_labels
+            tr_f = torch.stack([train_cache[i] for i in range(n_tr)]).numpy()
+            va_f = torch.stack([val_cache[i]   for i in range(n_val)]).numpy()
+            te_f = torch.stack([test_cache[i]  for i in range(n_te)]).numpy()
+            tr_l, va_l, te_l = train_labels, val_labels, test_labels
             print(f"\n  [teacher {cfg_name}] using cached FP features "
-                  f"(train={len(tr_f)}, test={len(te_f)})", flush=True)
+                  f"(train={len(tr_f)}, val={len(va_f)}, test={len(te_f)})", flush=True)
         else:
             print(f"\n  [teacher {cfg_name}] computing train features...", flush=True)
             tr_f, tr_l = extract_features(teacher, train_eval_loader, device, AMP_DTYPE, wb, ab)
             print(f"  [teacher {cfg_name}] train features done ({len(tr_f)} samples)", flush=True)
+            print(f"  [teacher {cfg_name}] computing val features...", flush=True)
+            va_f, va_l = extract_features(teacher, val_eval_loader,   device, AMP_DTYPE, wb, ab)
+            print(f"  [teacher {cfg_name}] val features done ({len(va_f)} samples)", flush=True)
             print(f"  [teacher {cfg_name}] computing test features...", flush=True)
             te_f, te_l = extract_features(teacher, test_loader,       device, AMP_DTYPE, wb, ab)
             print(f"  [teacher {cfg_name}] test features done ({len(te_f)} samples)", flush=True)
         print(f"  [teacher {cfg_name}] fitting probes...", flush=True)
-        mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
-        auroc_results[f"teacher_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
-        print(f"    mean AUROC = {mean_auc:.4f}")
+        mean_auc, per_cond, std_auc, per_cond_std, seed_aucs = run_auroc_probe(tr_f, tr_l, va_f, va_l, te_f, te_l, label_names, device)
+        auroc_results[f"teacher_{cfg_name}"] = {
+            "mean_auroc": round(mean_auc, 4),
+            "std_auroc": round(std_auc, 4),
+            "per_condition": per_cond,
+            "per_condition_std": {k: round(v, 4) for k, v in per_cond_std.items()},
+            "seed_aucs": [round(v, 4) for v in seed_aucs],
+        }
+        print(f"    mean AUROC = {mean_auc:.4f} ± {std_auc:.4f}")
 
     results = {
         "script": "run_qit_merlin_fulldata",
         "n_train_val": N,
         "n_test": len(test_ds),
-        "epochs": EPOCHS,
+        "epochs": args.epochs,
         "batch_size": BATCH_SIZE,
         "grad_accum": GRAD_ACCUM,
         "lr": LR,
-        "w_bits_range": [W_BITS_MIN, W_BITS_MAX],
-        "a_bits_range": [A_BITS_MIN, A_BITS_MAX],
+        "w_bits_range": [args.w_bits_min, args.w_bits_max],
+        "a_bits_range": [args.a_bits_min, args.a_bits_max],
         "label_names": label_names,
         "auroc": auroc_results,
     }

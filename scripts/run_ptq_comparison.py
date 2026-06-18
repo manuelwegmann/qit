@@ -40,7 +40,7 @@ sys.path.insert(0, str(_ROOT))
 from models.quantization import calibrate_activations
 from models.eval_utils import (
     _pbar, QUANT_CONFIGS, _TRANSFORM, load_backbone,
-    extract_features, run_probe,
+    extract_features, run_probe, split_train_val,
 )
 
 
@@ -93,7 +93,10 @@ def evaluate_model(model, label, calib_loader,
                                           wb, ab, weight_granularity, calib_stats)
             te_f, te_l = extract_features(model, probe_test_loader,  device, use_amp,
                                           wb, ab, weight_granularity, calib_stats)
-            acc = run_probe(tr_f, tr_l, te_f, te_l, device)
+            # Hold out a slice of the probe-train set for early stopping /
+            # best-checkpoint selection.
+            tr_idx, va_idx = split_train_val(len(tr_l))
+            acc = run_probe(tr_f[tr_idx], tr_l[tr_idx], tr_f[va_idx], tr_l[va_idx], te_f, te_l, device)
             row[mode_name] = round(acc, 4)
             print(f"    {mode_name:<12} acc={acc:.4f}")
         model_results[qk] = row

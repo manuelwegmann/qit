@@ -37,7 +37,7 @@ sys.path.insert(0, str(_ROOT))
 from models.quantization import quantized_forward, BitWidthSampler
 from models.eval_utils import (
     _pbar, QUANT_CONFIGS, _TRANSFORM, build_backbone,
-    extract_features, run_probe,
+    extract_features, run_probe, split_train_val,
 )
 
 
@@ -629,10 +629,13 @@ def main():
         t_te, l_te = extract_features(teacher, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
         s_te, _    = extract_features(student, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
 
+        # Hold out a slice of the probe-train set for early stopping / best-
+        # checkpoint selection (same split for teacher and student features).
+        tr_idx, va_idx = split_train_val(len(l_tr))
         feat_sim    = float(F.cosine_similarity(
             torch.tensor(s_tr), torch.tensor(t_tr)).mean())
-        teacher_acc = run_probe(t_tr, l_tr, t_te, l_te, device)
-        student_acc = run_probe(s_tr, l_tr, s_te, l_te, device)
+        teacher_acc = run_probe(t_tr[tr_idx], l_tr[tr_idx], t_tr[va_idx], l_tr[va_idx], t_te, l_te, device)
+        student_acc = run_probe(s_tr[tr_idx], l_tr[tr_idx], s_tr[va_idx], l_tr[va_idx], s_te, l_te, device)
         delta       = student_acc - teacher_acc
 
         print(f"  {qk:<8}  {teacher_acc:>12.4f}  {student_acc:>12.4f}  "

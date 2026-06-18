@@ -368,27 +368,37 @@ def extract_features(model, loader, device, use_amp, amp_dtype,
     return torch.cat(all_f).numpy(), torch.cat(all_y).numpy()
 
 
-def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
+def run_auroc_probe(train_feats, train_labels, val_feats, val_labels,
+                    test_feats, test_labels,
                     label_names, device, epochs=300, lr=1e-3, batch_size=256, n_seeds=5):
     """Masked-BCE linear probe for multi-label AUROC.
 
-    Trains n_seeds independently-initialised probes (different init + shuffle)
-    and averages AUROC across seeds for a more robust estimate on small test sets.
+    Trains n_seeds independently-initialised probes (different init + shuffle).
+    Early stopping and best-checkpoint selection use held-out val_feats/val_labels
+    (not the training loss) to avoid overfitting the probe head, and the
+    best-val-epoch weights are restored before evaluating AUROC on test_feats.
+    AUROC is averaged across seeds for a more robust estimate on small test sets.
 
-    Labels: 1=positive, 0=negative, -1=unknown (masked out during training).
-    Returns (mean_auroc, per_condition_auroc_dict).
+    Labels: 1=positive, 0=negative, -1=unknown (masked out during training/val).
+    Returns (mean_auroc, per_condition_auroc_dict, std_auroc, per_condition_std_dict, seed_aucs),
+    where the std values are the across-seed standard deviation (n_seeds=5 by default)
+    and seed_aucs is the list of per-seed mean AUROCs (averaged over conditions).
     """
     from sklearn.metrics import roc_auc_score
 
-    X_tr = torch.tensor(train_feats, dtype=torch.float32)
-    y_tr = torch.tensor(np.clip(train_labels, 0, 1).astype(np.float32))
-    m_tr = torch.tensor((train_labels >= 0).astype(np.float32))
-    X_te = torch.tensor(test_feats,  dtype=torch.float32)
+    X_tr  = torch.tensor(train_feats, dtype=torch.float32)
+    y_tr  = torch.tensor(np.clip(train_labels, 0, 1).astype(np.float32))
+    m_tr  = torch.tensor((train_labels >= 0).astype(np.float32))
+    X_val = torch.tensor(val_feats, dtype=torch.float32)
+    y_val = torch.tensor(np.clip(val_labels, 0, 1).astype(np.float32))
+    m_val = torch.tensor((val_labels >= 0).astype(np.float32))
+    X_te  = torch.tensor(test_feats,  dtype=torch.float32)
 
     mu  = X_tr.mean(0)
     std = X_tr.std(0).clamp(min=1e-8)
-    X_tr = (X_tr - mu) / std
-    X_te = (X_te - mu) / std
+    X_tr  = (X_tr  - mu) / std
+    X_val = (X_val - mu) / std
+    X_te  = (X_te  - mu) / std
 
     n_cond = y_tr.shape[1]
 
@@ -401,6 +411,10 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
     per_cond_runs = {label_names[c]: [] for c in valid_conds}
     mean_aucs = []
 
+    X_val_dev = X_val.to(device)
+    y_val_dev = y_val.to(device)
+    m_val_dev = m_val.to(device)
+
     for seed in range(n_seeds):
         torch.manual_seed(seed)
         head   = nn.Linear(X_tr.shape[1], n_cond).to(device)
@@ -410,26 +424,31 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
         ds     = torch.utils.data.TensorDataset(X_tr.to(device), y_tr.to(device), m_tr.to(device))
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-        best_loss, no_imp = float("inf"), 0
+        best_val_loss, no_imp = float("inf"), 0
+        best_state = {k: v.clone() for k, v in head.state_dict().items()}
         for _ in range(epochs):
             head.train()
-            ep_loss = 0.0
             for xb, yb, mb in loader:
                 opt.zero_grad()
                 raw  = F.binary_cross_entropy_with_logits(head(xb), yb, reduction="none")
                 loss = (raw * mb).sum() / mb.sum().clamp(min=1)
                 loss.backward()
                 opt.step()
-                ep_loss += loss.item()
             sch.step()
-            ep_loss /= len(loader)
-            if best_loss - ep_loss > 1e-5:
-                best_loss, no_imp = ep_loss, 0
+
+            head.eval()
+            with torch.no_grad():
+                raw_val  = F.binary_cross_entropy_with_logits(head(X_val_dev), y_val_dev, reduction="none")
+                val_loss = ((raw_val * m_val_dev).sum() / m_val_dev.sum().clamp(min=1)).item()
+            if best_val_loss - val_loss > 1e-5:
+                best_val_loss, no_imp = val_loss, 0
+                best_state = {k: v.clone() for k, v in head.state_dict().items()}
             else:
                 no_imp += 1
             if no_imp >= 30:
                 break
 
+        head.load_state_dict(best_state)
         head.eval()
         with torch.no_grad():
             preds = torch.sigmoid(head(X_te.to(device))).cpu().numpy()
@@ -450,9 +469,11 @@ def run_auroc_probe(train_feats, train_labels, test_feats, test_labels,
         else:
             print(f"      probe seed {seed + 1}/{n_seeds} done (no valid conditions)", flush=True)
 
-    per_cond   = {name: float(np.mean(vals)) for name, vals in per_cond_runs.items() if vals}
-    mean_auroc = float(np.mean(mean_aucs)) if mean_aucs else float("nan")
-    return mean_auroc, per_cond
+    per_cond     = {name: float(np.mean(vals)) for name, vals in per_cond_runs.items() if vals}
+    per_cond_std = {name: float(np.std(vals))  for name, vals in per_cond_runs.items() if vals}
+    mean_auroc   = float(np.mean(mean_aucs)) if mean_aucs else float("nan")
+    std_auroc    = float(np.std(mean_aucs))  if mean_aucs else float("nan")
+    return mean_auroc, per_cond, std_auroc, per_cond_std, mean_aucs
 
 
 # ---------------------------------------------------------------------------
@@ -747,46 +768,68 @@ def main():
     eval_loader_kw = dict(batch_size=args.batch_size, shuffle=False,
                           num_workers=0, pin_memory=False)
     train_eval_loader = DataLoader(train_ds, **eval_loader_kw)
+    val_eval_loader   = DataLoader(val_ds,   **eval_loader_kw)
     test_loader       = DataLoader(test_ds,  **eval_loader_kw)
 
     auroc_results = {}
 
-    # Student at every quant config
+    # Student at every quant config. The QIT val split (held out from probe
+    # fitting) is used for the probe's early stopping / best-checkpoint selection.
     for cfg_name, wb, ab in _EVAL_CONFIGS:
         print(f"\n  [student {cfg_name}] computing train features...", flush=True)
         tr_f, tr_l = extract_features(student, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
         print(f"  [student {cfg_name}] train features done ({len(tr_f)} samples)", flush=True)
+        print(f"  [student {cfg_name}] computing val features...", flush=True)
+        va_f, va_l = extract_features(student, val_eval_loader,   device, use_amp, amp_dtype, wb, ab)
+        print(f"  [student {cfg_name}] val features done ({len(va_f)} samples)", flush=True)
         print(f"  [student {cfg_name}] computing test features...", flush=True)
         te_f, te_l = extract_features(student, test_loader,       device, use_amp, amp_dtype, wb, ab)
         print(f"  [student {cfg_name}] test features done ({len(te_f)} samples)", flush=True)
         print(f"  [student {cfg_name}] fitting probes...", flush=True)
-        mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
-        auroc_results[f"student_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
-        print(f"    mean AUROC = {mean_auc:.4f}")
+        mean_auc, per_cond, std_auc, per_cond_std, seed_aucs = run_auroc_probe(tr_f, tr_l, va_f, va_l, te_f, te_l, label_names, device)
+        auroc_results[f"student_{cfg_name}"] = {
+            "mean_auroc": round(mean_auc, 4),
+            "std_auroc": round(std_auc, 4),
+            "per_condition": per_cond,
+            "per_condition_std": {k: round(v, 4) for k, v in per_cond_std.items()},
+            "seed_aucs": [round(v, 4) for v in seed_aucs],
+        }
+        print(f"    mean AUROC = {mean_auc:.4f} ± {std_auc:.4f}")
 
     # Teacher at every quant config (direct comparison baseline)
     train_labels = _get_labels(train_ds)
+    val_labels   = _get_labels(val_ds)
     test_labels  = _get_labels(test_ds)
     for cfg_name, wb, ab in _EVAL_CONFIGS:
         if wb is None:
             # FP features are already cached — reuse instead of a second
             # forward pass over the full teacher model.
             tr_f = torch.stack([teacher_cache[i]      for i in range(len(train_ds))]).numpy()
+            va_f = torch.stack([teacher_val_cache[i]  for i in range(len(val_ds))]).numpy()
             te_f = torch.stack([teacher_test_cache[i] for i in range(len(test_ds))]).numpy()
-            tr_l, te_l = train_labels, test_labels
+            tr_l, va_l, te_l = train_labels, val_labels, test_labels
             print(f"\n  [teacher {cfg_name}] using cached FP features "
-                  f"(train={len(tr_f)}, test={len(te_f)})", flush=True)
+                  f"(train={len(tr_f)}, val={len(va_f)}, test={len(te_f)})", flush=True)
         else:
             print(f"\n  [teacher {cfg_name}] computing train features...", flush=True)
             tr_f, tr_l = extract_features(teacher, train_eval_loader, device, use_amp, amp_dtype, wb, ab)
             print(f"  [teacher {cfg_name}] train features done ({len(tr_f)} samples)", flush=True)
+            print(f"  [teacher {cfg_name}] computing val features...", flush=True)
+            va_f, va_l = extract_features(teacher, val_eval_loader,   device, use_amp, amp_dtype, wb, ab)
+            print(f"  [teacher {cfg_name}] val features done ({len(va_f)} samples)", flush=True)
             print(f"  [teacher {cfg_name}] computing test features...", flush=True)
             te_f, te_l = extract_features(teacher, test_loader,       device, use_amp, amp_dtype, wb, ab)
             print(f"  [teacher {cfg_name}] test features done ({len(te_f)} samples)", flush=True)
         print(f"  [teacher {cfg_name}] fitting probes...", flush=True)
-        mean_auc, per_cond = run_auroc_probe(tr_f, tr_l, te_f, te_l, label_names, device)
-        auroc_results[f"teacher_{cfg_name}"] = {"mean_auroc": round(mean_auc, 4), "per_condition": per_cond}
-        print(f"    mean AUROC = {mean_auc:.4f}")
+        mean_auc, per_cond, std_auc, per_cond_std, seed_aucs = run_auroc_probe(tr_f, tr_l, va_f, va_l, te_f, te_l, label_names, device)
+        auroc_results[f"teacher_{cfg_name}"] = {
+            "mean_auroc": round(mean_auc, 4),
+            "std_auroc": round(std_auc, 4),
+            "per_condition": per_cond,
+            "per_condition_std": {k: round(v, 4) for k, v in per_cond_std.items()},
+            "seed_aucs": [round(v, 4) for v in seed_aucs],
+        }
+        print(f"    mean AUROC = {mean_auc:.4f} ± {std_auc:.4f}")
 
     # ── save ──────────────────────────────────────────────────────────────
     results = {
