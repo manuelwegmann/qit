@@ -52,15 +52,16 @@ sys.path.insert(1, str(_QFT))
 
 from models.quantization import calibrate_activations, static_quantized_forward
 from models.eval_utils import _pbar, MerlinEncoder
+from models.merlin_utils import (
+    ResizedDataset as _ResizedDataset,
+    DEFAULT_DATA_DIR as _DEFAULT_DATA_DIR,
+    DEFAULT_REPORTS as _DEFAULT_REPORTS,
+    DEFAULT_LABELS as _DEFAULT_LABELS,
+    DEFAULT_METADATA as _DEFAULT_METADATA,
+)
 from downstream.dataset import MerlinDataset
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
-_CT_DATA          = _ROOT.parent / "CT-CLIP" / "data"
-_DEFAULT_DATA_DIR = str(_CT_DATA / "merlin_data")
-_DEFAULT_REPORTS  = str(_CT_DATA / "reports_final.xlsx")
-_DEFAULT_LABELS   = str(_CT_DATA / "zero_shot_findings_disease_cls.csv")
-_DEFAULT_METADATA = str(_CT_DATA / "metadata.csv")
 
 _QUANT_CONFIGS = {
     "w8a8": (8, 8), "w6a6": (6, 6), "w5a5": (5, 5), "w4a8": (4, 8),
@@ -68,22 +69,6 @@ _QUANT_CONFIGS = {
 }
 _CONFIG_ORDER  = ["fp", "w8a8", "w6a6", "w5a5", "w4a8", "w4a4", "w3a6", "w2a8", "w2a4"]
 _SPLITS        = ["train", "val", "test"]
-
-
-class _ResizedDataset(torch.utils.data.Dataset):
-    def __init__(self, ds, target_shape):
-        self._ds     = ds
-        self._target = tuple(target_shape)
-
-    def __len__(self):
-        return len(self._ds)
-
-    def __getitem__(self, i):
-        x, y = self._ds[i]
-        if tuple(x.shape[1:]) != self._target:
-            x = F.interpolate(x.unsqueeze(0), size=self._target,
-                              mode="trilinear", align_corners=False).squeeze(0)
-        return x, y
 
 
 @torch.no_grad()

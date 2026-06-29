@@ -51,41 +51,19 @@ sys.path.insert(1, str(_QFT))
 
 from models.quantization import calibrate_activations, quantized_forward, static_quantized_forward
 from models.eval_utils import _pbar, MerlinEncoder
+from models.merlin_utils import (
+    ResizedDataset as _ResizedDataset,
+    DEFAULT_DATA_DIR as _DEFAULT_DATA_DIR,
+    DEFAULT_REPORTS as _DEFAULT_REPORTS,
+    DEFAULT_LABELS as _DEFAULT_LABELS,
+    DEFAULT_METADATA as _DEFAULT_METADATA,
+)
 from downstream.dataset import MerlinDataset
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-_CT_DATA = _ROOT.parent / "CT-CLIP" / "data"
-_DEFAULT_DATA_DIR = str(_CT_DATA / "merlin_data")
-_DEFAULT_REPORTS  = str(_CT_DATA / "reports_final.xlsx")
-_DEFAULT_LABELS   = str(_CT_DATA / "zero_shot_findings_disease_cls.csv")
-_DEFAULT_METADATA = str(_CT_DATA / "metadata.csv")
-
 _QUANT_CONFIGS = {"w8a8": (8, 8), "w4a8": (4, 8), "w4a4": (4, 4)}
 _CONFIG_ORDER  = ["w8a8", "w4a8", "w4a4"]
-
-
-# ---------------------------------------------------------------------------
-# Dataset wrapper (mirrors run_qit_merlin.py)
-# ---------------------------------------------------------------------------
-
-class _ResizedDataset(torch.utils.data.Dataset):
-    """Trilinearly resizes CT volumes to a fixed (D, H, W) on load."""
-    def __init__(self, ds, target_shape: tuple):
-        self._ds = ds
-        self._target = tuple(target_shape)
-
-    def __len__(self):
-        return len(self._ds)
-
-    def __getitem__(self, i):
-        x, y = self._ds[i]
-        if tuple(x.shape[1:]) != self._target:
-            x = F.interpolate(
-                x.unsqueeze(0), size=self._target,
-                mode="trilinear", align_corners=False,
-            ).squeeze(0)
-        return x, y
 
 
 # ---------------------------------------------------------------------------
