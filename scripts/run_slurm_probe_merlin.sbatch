@@ -18,12 +18,14 @@ echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)  (${
 #   FEAT_DIR=runs/teacher_features             sbatch scripts/run_slurm_probe_merlin.sbatch
 FEAT_DIR="${FEAT_DIR:-runs/qit_merlin_fulldata/features}"
 
-CONFIGS="${CONFIGS:-fp w8a8 w4a8 w4a4}"
+CONFIGS="${CONFIGS:-fp w8a8 w6a6 w5a5 w4a8 w4a4 w3a6 w2a8 w2a4}"
 MIN_TEST_PER_CLASS="${MIN_TEST_PER_CLASS:-20}"
-PROBE_EPOCHS="${PROBE_EPOCHS:-200}"
+PROBE_MAX_EPOCHS="${PROBE_MAX_EPOCHS:-300}"
 PROBE_SEEDS="${PROBE_SEEDS:-5}"
 PROBE_LR="${PROBE_LR:-1e-3}"
-WEIGHT_DECAYS="${WEIGHT_DECAYS:-0.0 1e-4 1e-3 1e-2 1e-1}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+ES_PATIENCE="${ES_PATIENCE:-20}"
+ES_TOL="${ES_TOL:-1e-3}"
 OUTPUT_DIR="${OUTPUT_DIR:-${FEAT_DIR}/probe_results}"
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR}"
@@ -36,7 +38,7 @@ trap "rm -rf '${TMPDIR}'" EXIT
 echo "=== probe_merlin  job=${SLURM_JOB_ID}  node=$(hostname) ==="
 echo "feat_dir=${FEAT_DIR}"
 echo "configs=${CONFIGS}"
-echo "probe: epochs=${PROBE_EPOCHS}  seeds=${PROBE_SEEDS}  lr=${PROBE_LR}  weight_decays=${WEIGHT_DECAYS}"
+echo "probe: max_epochs=${PROBE_MAX_EPOCHS}  seeds=${PROBE_SEEDS}  lr=${PROBE_LR}  weight_decay=${WEIGHT_DECAY}  es_patience=${ES_PATIENCE}  es_tol=${ES_TOL}"
 echo "output=${OUTPUT_DIR}"
 date
 
@@ -50,10 +52,12 @@ python -u scripts/run_probe_merlin.py \
     --feat_dir           "${FEAT_DIR}"            \
     --configs            ${CONFIGS}               \
     --min_test_per_class "${MIN_TEST_PER_CLASS}"  \
-    --probe_epochs       "${PROBE_EPOCHS}"        \
+    --probe_max_epochs   "${PROBE_MAX_EPOCHS}"    \
     --probe_seeds        "${PROBE_SEEDS}"         \
     --probe_lr           "${PROBE_LR}"            \
-    --weight_decays      ${WEIGHT_DECAYS}         \
+    --weight_decay       "${WEIGHT_DECAY}"        \
+    --es_patience        "${ES_PATIENCE}"         \
+    --es_tol             "${ES_TOL}"              \
     --output_dir         "${OUTPUT_DIR}"
 
 echo "=== done ===" && date

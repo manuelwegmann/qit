@@ -63,14 +63,15 @@ def _probe_method_str(data):
     seeds  = data.get("probe_seeds", "?")
     min_pc = data.get("min_test_per_class", "?")
     if "es_patience" in data:
-        # run_probe_merlin_alternative.py: per-condition independent probe,
-        # early-stopped on that condition's own val AUROC.
+        # run_probe_merlin.py: per-condition independent probe, early-stopped on
+        # that condition's own val AUROC.
         max_epochs = data.get("probe_max_epochs", "?")
         patience   = data.get("es_patience", "?")
         wd         = data.get("weight_decay", "?")
-        return (f"Linear probe (alt): per-condition early stopping, up to {max_epochs} epochs, "
+        return (f"Linear probe: per-condition early stopping, up to {max_epochs} epochs, "
                 f"patience={patience} · {seeds} seeds · weight decay={wd} · "
                 f"class-balanced via pos_weight · min(test_pos,test_neg)≥{min_pc}")
+    # Legacy fixed-epochs + weight-decay-grid results.json (pre-consolidation).
     epochs = data.get("probe_epochs", "?")
     wds    = data.get("weight_decays", [])
     wd_str = ", ".join(f"{w:g}" for w in wds) if wds else "?"
