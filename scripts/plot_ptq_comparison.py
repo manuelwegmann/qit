@@ -22,26 +22,10 @@ import matplotlib.lines as mlines
 import numpy as np
 
 
-_DATASET_LABELS = {
-    "cifar10": "CIFAR-10",
-    "stl10":   "STL-10",
-}
-_BACKBONE_LABELS = {
-    "resnet18":           "ResNet-18",
-    "efficientnet_b0":    "EfficientNet-B0",
-    "mobilenet_v3_small": "MobileNet-V3-Small",
-    "vit_b_16":           "ViT-B/16",
-    "swin_t":             "Swin-T",
-}
-_CONFIG_ORDER = ["fp", "w8a8", "w6a6", "w4a6", "w4a4", "w2a4"]
-_CONFIG_LABELS = {
-    "fp":   "FP",
-    "w8a8": "W8A8",
-    "w6a6": "W6A6",
-    "w4a6": "W4A6",
-    "w4a4": "W4A4",
-    "w2a4": "W2A4",
-}
+from _plotstyle import (
+    CONFIG_LABELS as _CONFIG_LABELS, CONFIG_ORDER as _CONFIG_ORDER,
+    DATASET_LABELS as _DATASET_LABELS, BACKBONE_LABELS as _BACKBONE_LABELS,
+)
 
 # Two models → two colour families
 _COLORS = ["#2563EB", "#DC2626"]   # blue = model_a, red = model_b

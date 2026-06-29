@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 
 
-_COLORS = ["#2563EB", "#DC2626", "#16A34A", "#9333EA", "#EA580C"]
+from _plotstyle import QAT_COLORS as _COLORS
 
 
 def _init_label(init_str: str) -> str:

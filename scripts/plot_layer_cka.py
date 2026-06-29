@@ -26,14 +26,9 @@ import numpy as np
 
 # ── cosmetics ──────────────────────────────────────────────────────────────
 
-_DATASET_LABELS = {"cifar10": "CIFAR-10", "stl10": "STL-10"}
-_BACKBONE_LABELS = {
-    "resnet18":           "ResNet-18",
-    "efficientnet_b0":    "EfficientNet-B0",
-    "mobilenet_v3_small": "MobileNet-V3-Small",
-    "vit_b_16":           "ViT-B/16",
-    "swin_t":             "Swin-T",
-}
+from _plotstyle import (
+    DATASET_LABELS as _DATASET_LABELS, BACKBONE_LABELS as _BACKBONE_LABELS,
+)
 
 # Palette: light-to-dark blue for shallow→deep layers
 _LAYER_COLORS = ["#93C5FD", "#3B82F6", "#1D4ED8", "#1E3A5F"]

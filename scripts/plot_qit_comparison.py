@@ -21,21 +21,12 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 
-# Display names and ordering (least → most aggressive quantization)
-_CONFIG_LABELS = {
-    "fp":   "FP",
-    "w8a8": "W8A8",
-    "w6a6": "W6A6",
-    "w4a6": "W4A6",
-    "w4a4": "W4A4",
-    "w2a4": "W2A4",
-}
-_CONFIG_ORDER = list(_CONFIG_LABELS.keys())
-
-_TEACHER_COLOR = "#6B7280"   # neutral grey
-_STUDENT_COLOR = "#2563EB"   # blue
-_DELTA_POS     = "#16A34A"   # green
-_DELTA_NEG     = "#DC2626"   # red
+# Display names/ordering and the teacher-vs-student palette are shared (_plotstyle).
+from _plotstyle import (
+    CONFIG_LABELS as _CONFIG_LABELS, CONFIG_ORDER as _CONFIG_ORDER,
+    TEACHER_COLOR as _TEACHER_COLOR, STUDENT_COLOR as _STUDENT_COLOR,
+    DELTA_POS as _DELTA_POS, DELTA_NEG as _DELTA_NEG,
+)
 
 
 def main():

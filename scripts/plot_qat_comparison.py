@@ -35,20 +35,10 @@ import numpy as np
 # Display-name maps (extend as new backbones / datasets are added)
 # ---------------------------------------------------------------------------
 
-_DATASET_LABELS = {
-    "cifar10": "CIFAR-10",
-    "stl10":   "STL-10",
-}
-
-_BACKBONE_LABELS = {
-    "resnet18":           "ResNet-18",
-    "efficientnet_b0":    "EfficientNet-B0",
-    "mobilenet_v3_small": "MobileNet-V3-Small",
-    "vit_b_16":           "ViT-B/16",
-    "swin_t":             "Swin-T",
-}
-
-_COLORS = ["#2563EB", "#DC2626", "#16A34A", "#9333EA", "#EA580C"]
+from _plotstyle import (
+    DATASET_LABELS as _DATASET_LABELS, BACKBONE_LABELS as _BACKBONE_LABELS,
+    QAT_COLORS as _COLORS,
+)
 
 
 # ---------------------------------------------------------------------------
