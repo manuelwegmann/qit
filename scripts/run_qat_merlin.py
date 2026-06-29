@@ -20,7 +20,7 @@ condition's label (BCE loss):
 Run twice — once from the pretrained Merlin checkpoint and once from a QIT
 checkpoint — to compare whether QIT gives QAT a better starting point, and
 whether the quantized model can replicate the FP linear-probe AUROC reported
-by run_qit_merlin_fulldata.py for the same condition.
+by run_qit_merlin.py --full_data for the same condition.
 
 Train/val/test splits come from MerlinDataset(label_cols=[--condition],
 require_labeled=True), so only scans with a non-missing label for that
@@ -69,31 +69,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 from models.quantization import quantized_forward
 from models.eval_utils import _pbar, MerlinEncoder
+from models.merlin_utils import (
+    ResizedDataset as _ResizedDataset,
+    DEFAULT_DATA_DIR, DEFAULT_REPORTS, DEFAULT_LABELS, DEFAULT_METADATA,
+)
 from downstream.dataset import MerlinDataset
 
 TARGET_SHAPE = (160, 224, 224)
 AMP_DTYPE    = torch.bfloat16
 MERLIN_FEAT_DIM = 2048
-
-_CT_DATA = _ROOT.parent / "CT-CLIP" / "data"
-
-
-class _ResizedDataset(torch.utils.data.Dataset):
-    def __init__(self, ds, target_shape):
-        self._ds     = ds
-        self._target = tuple(target_shape)
-
-    def __len__(self):
-        return len(self._ds)
-
-    def __getitem__(self, i):
-        x, y = self._ds[i]
-        if tuple(x.shape[1:]) != self._target:
-            x = F.interpolate(
-                x.unsqueeze(0), size=self._target,
-                mode="trilinear", align_corners=False,
-            ).squeeze(0)
-        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +174,10 @@ def evaluate(model, head, loader, w_bits, a_bits, weight_granularity, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default=str(_CT_DATA / "merlin_data"))
-    parser.add_argument("--reports",  default=str(_CT_DATA / "reports_final.xlsx"))
-    parser.add_argument("--labels",   default=str(_CT_DATA / "zero_shot_findings_disease_cls.csv"))
-    parser.add_argument("--metadata", default=str(_CT_DATA / "metadata.csv"))
+    parser.add_argument("--data_dir", default=DEFAULT_DATA_DIR)
+    parser.add_argument("--reports",  default=DEFAULT_REPORTS)
+    parser.add_argument("--labels",   default=DEFAULT_LABELS)
+    parser.add_argument("--metadata", default=DEFAULT_METADATA)
     parser.add_argument("--condition", required=True,
                         help="Single label column from --labels, e.g. renal_cyst.")
     parser.add_argument("--init", required=True,

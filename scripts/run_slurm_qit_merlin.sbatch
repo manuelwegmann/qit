@@ -94,7 +94,6 @@ python -u scripts/run_qit_merlin.py \
     --output_dir  "${OUTPUT_DIR}"  \
     --freeze_layers "${FREEZE_LAYERS}"          \
     ${TARGET_SHAPE:+--target_shape $TARGET_SHAPE} \
-    ${FREEZE_BN:+--freeze_bn}                     \
-    ${EVAL_ONLY:+--eval_only}
+    ${FREEZE_BN:+--freeze_bn}
 
 echo "=== done ===" && date

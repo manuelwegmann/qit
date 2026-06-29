@@ -13,7 +13,7 @@ the script also reports the absolute GMACs/GFLOPs per backbone so that ratio mea
 something concrete.
 
 --baseline_bits defaults to 16, NOT 32: both run_qit.py and
-run_qit_merlin_fulldata.py run the "fp" (unquantized) pass under
+run_qit_merlin.py run the "fp" (unquantized) pass under
 torch.amp.autocast(dtype=torch.bfloat16) by default, so the "fp" entry in
 results.json is itself a bf16 (16x16) computation, not true FP32. Pass
 --baseline_bits 32 to compare against a true-FP32 reference instead.
@@ -50,7 +50,7 @@ from models.eval_utils import build_backbone, QUANT_CONFIGS, MerlinEncoder
 _CIFAR_BACKBONES = ["resnet18", "efficientnet_b0", "mobilenet_v3_small", "vit_b_16", "swin_t"]
 _ALL_BACKBONES = _CIFAR_BACKBONES + ["merlin"]
 
-# Mirrors run_qit_merlin_fulldata.py's _EVAL_CONFIGS
+# Default Merlin configs to report BitOps for (a representative subset).
 _MERLIN_CONFIGS = [
     ("fp",   None, None),
     ("w8a8", 8,    8),
@@ -212,7 +212,7 @@ def main():
     parser.add_argument("--baseline_bits", type=int, default=16,
                         help="Bit-width of the unquantized ('fp') reference. "
                              "Default 16, matching the bf16 autocast used by "
-                             "default in run_qit.py / run_qit_merlin_fulldata.py "
+                             "default in run_qit.py / run_qit_merlin.py "
                              "for the 'fp' eval pass. Use 32 for a true-FP32 "
                              "reference.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
