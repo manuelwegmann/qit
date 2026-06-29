@@ -28,7 +28,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
-_CONFIG_LABELS = {"fp": "FP", "w8a8": "W8A8", "w4a8": "W4A8", "w4a4": "W4A4"}
+_CONFIG_LABELS = {
+    "fp": "FP", "w8a8": "W8A8", "w6a6": "W6A6", "w5a5": "W5A5", "w4a8": "W4A8",
+    "w4a4": "W4A4", "w3a6": "W3A6", "w2a8": "W2A8", "w2a4": "W2A4",
+}
 _CONFIG_ORDER  = list(_CONFIG_LABELS.keys())
 
 _TEACHER_COLOR = "#F4A261"
@@ -45,18 +48,38 @@ _QUANT_METHOD = ("Static PTQ · percentile-clipped activation calibration "
                  "(pct99.99, 32 batches × bs16) · per-channel weight granularity")
 
 
+def _checkpoint_str(results_json_path):
+    """Read {feat_dir}/metadata.json (feat_dir = parent of probe_results[_alt])
+    to report which checkpoint produced these cached features."""
+    meta_path = Path(results_json_path).resolve().parent.parent / "metadata.json"
+    if not meta_path.exists():
+        return "checkpoint: unknown (no metadata.json found)"
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return f"checkpoint ({meta.get('model', '?')}): {meta.get('checkpoint', '?')}"
+
+
 def _probe_method_str(data):
-    epochs = data.get("probe_epochs", "?")
     seeds  = data.get("probe_seeds", "?")
+    min_pc = data.get("min_test_per_class", "?")
+    if "es_patience" in data:
+        # run_probe_merlin_alternative.py: per-condition independent probe,
+        # early-stopped on that condition's own val AUROC.
+        max_epochs = data.get("probe_max_epochs", "?")
+        patience   = data.get("es_patience", "?")
+        wd         = data.get("weight_decay", "?")
+        return (f"Linear probe (alt): per-condition early stopping, up to {max_epochs} epochs, "
+                f"patience={patience} · {seeds} seeds · weight decay={wd} · "
+                f"class-balanced via pos_weight · min(test_pos,test_neg)≥{min_pc}")
+    epochs = data.get("probe_epochs", "?")
     wds    = data.get("weight_decays", [])
     wd_str = ", ".join(f"{w:g}" for w in wds) if wds else "?"
-    min_pc = data.get("min_test_per_class", "?")
     return (f"Linear probe: {epochs} fixed epochs (no early stopping) · {seeds} seeds · "
             f"weight decay ∈ {{{wd_str}}} selected by val loss · "
             f"class-balanced via pos_weight · min(test_pos,test_neg)≥{min_pc}")
 
 
-def plot_mean_auroc(student, teacher, out_path):
+def plot_mean_auroc(student, teacher, student_path, teacher_path, out_path):
     configs = [c for c in _CONFIG_ORDER
               if c in student["results"] and c in teacher["results"]]
     labels  = [_CONFIG_LABELS[c] for c in configs]
@@ -125,8 +148,10 @@ def plot_mean_auroc(student, teacher, out_path):
     n_cond = len(student["results"][configs[0]]["per_condition"])
     title = f"Merlin linear-probe AUROC — pretrained vs QIT across quantization\n(mean over {n_cond} eligible conditions, error bars: ±1 std over 5 probe seeds)"
     ax.set_title(title, fontsize=13, fontweight="bold", pad=14)
-    fig.text(0.01, -0.02, f"{_QUANT_METHOD}\n{_probe_method_str(student)}",
-             fontsize=8, color="#6B7280", ha="left", va="top")
+    footer = (f"{_QUANT_METHOD}\n{_probe_method_str(student)}\n"
+              f"Teacher {_checkpoint_str(teacher_path)}\n"
+              f"Student {_checkpoint_str(student_path)}")
+    fig.text(0.01, -0.02, footer, fontsize=8, color="#6B7280", ha="left", va="top")
 
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,7 +160,7 @@ def plot_mean_auroc(student, teacher, out_path):
     plt.close(fig)
 
 
-def plot_per_condition(data, model_name, color, out_path):
+def plot_per_condition(data, model_name, color, data_path, out_path):
     configs = [c for c in _CONFIG_ORDER if c in data["results"]]
     labels  = [_CONFIG_LABELS[c] for c in configs]
     conditions = sorted(data["results"][configs[0]]["per_condition"].keys())
@@ -166,8 +191,8 @@ def plot_per_condition(data, model_name, color, out_path):
 
     title = f"Merlin linear-probe AUROC per condition — {model_name} — across quantization"
     ax.set_title(title, fontsize=13, fontweight="bold", pad=14)
-    fig.text(0.01, -0.02, f"{_QUANT_METHOD}\n{_probe_method_str(data)}",
-             fontsize=8, color="#6B7280", ha="left", va="top")
+    footer = f"{_QUANT_METHOD}\n{_probe_method_str(data)}\n{_checkpoint_str(data_path)}"
+    fig.text(0.01, -0.02, footer, fontsize=8, color="#6B7280", ha="left", va="top")
 
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,10 +216,11 @@ def main():
         teacher = json.load(f)
 
     out_dir = Path(args.out_dir)
-    plot_mean_auroc(student, teacher, out_dir / "probe_merlin_mean_auroc.png")
-    plot_per_condition(student, "Student (QIT)", _STUDENT_COLOR,
+    plot_mean_auroc(student, teacher, args.student, args.teacher,
+                    out_dir / "probe_merlin_mean_auroc.png")
+    plot_per_condition(student, "Student (QIT)", _STUDENT_COLOR, args.student,
                        out_dir / "probe_merlin_per_condition_student.png")
-    plot_per_condition(teacher, "Teacher (pretrained)", _TEACHER_COLOR,
+    plot_per_condition(teacher, "Teacher (pretrained)", _TEACHER_COLOR, args.teacher,
                        out_dir / "probe_merlin_per_condition_teacher.png")
 
 

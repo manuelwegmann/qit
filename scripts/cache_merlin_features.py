@@ -62,8 +62,11 @@ _DEFAULT_REPORTS  = str(_CT_DATA / "reports_final.xlsx")
 _DEFAULT_LABELS   = str(_CT_DATA / "zero_shot_findings_disease_cls.csv")
 _DEFAULT_METADATA = str(_CT_DATA / "metadata.csv")
 
-_QUANT_CONFIGS = {"w8a8": (8, 8), "w4a8": (4, 8), "w4a4": (4, 4)}
-_CONFIG_ORDER  = ["fp", "w8a8", "w4a8", "w4a4"]
+_QUANT_CONFIGS = {
+    "w8a8": (8, 8), "w6a6": (6, 6), "w5a5": (5, 5), "w4a8": (4, 8),
+    "w4a4": (4, 4), "w3a6": (3, 6), "w2a8": (2, 8), "w2a4": (2, 4),
+}
+_CONFIG_ORDER  = ["fp", "w8a8", "w6a6", "w5a5", "w4a8", "w4a4", "w3a6", "w2a8", "w2a4"]
 _SPLITS        = ["train", "val", "test"]
 
 
@@ -177,6 +180,16 @@ def main():
     with open(names_file, "w") as f:
         json.dump(label_names, f, indent=2)
     print(f"  label_names.json  ({len(label_names)} conditions)")
+
+    # Provenance pointer so downstream probe/plot scripts can show which
+    # checkpoint these features came from.
+    meta = {
+        "model":      args.model,
+        "checkpoint": args.student_ckpt if args.model == "student" else "pretrained (no checkpoint)",
+    }
+    with open(out / "metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"  metadata.json  (checkpoint={meta['checkpoint']})")
 
     all_labels = {}
     for split, ds in split_datasets.items():

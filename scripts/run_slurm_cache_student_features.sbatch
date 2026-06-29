@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=14
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --exclude=hendrixgpu05fl,hendrixgpu06fl,hendrixgpu09fl,hendrixgpu10fl,hendrixgpu11fl,hendrixgpu12fl,hendrixgpu13fl,hendrixgpu17fl,hendrixgpu18fl,hendrixgpu19fl,hendrixgpu20fl
 
 GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
@@ -21,7 +21,7 @@ STUDENT_CKPT="${STUDENT_CKPT:-runs/qit_merlin_fulldata/checkpoint_final.pt}"
 # Output goes into the same run folder as the checkpoint.
 OUTPUT_DIR="${OUTPUT_DIR:-$(dirname ${STUDENT_CKPT})/features}"
 
-CONFIGS="${CONFIGS:-fp w8a8 w4a8 w4a4}"
+CONFIGS="${CONFIGS:-fp w8a8 w6a6 w5a5 w4a8 w4a4 w3a6 w2a8 w2a4}"
 SPLITS="${SPLITS:-train val test}"
 PERCENTILE="${PERCENTILE:-99.99}"
 N_CALIB_BATCHES="${N_CALIB_BATCHES:-32}"
