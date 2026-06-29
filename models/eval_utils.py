@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision import models, transforms
+from torchvision import datasets, models, transforms
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -102,6 +102,27 @@ def load_backbone(backbone_name: str, checkpoint: str, device: torch.device) -> 
         state = ckpt.get("student", ckpt)
         model.load_state_dict(state)
     return model.to(device)
+
+
+def load_vision_dataset(dataset: str, split: str, data_dir: str,
+                        transform=_TRANSFORM, download: bool = True):
+    """Construct one torchvision split with the standard QIT transform.
+
+    Centralizes the CIFAR10(train=...) vs STL10(split=...) constructor mapping so
+    the experiment scripts compose their splits from a single place. Returns the
+    same Dataset object a direct constructor call would.
+
+      stl10   splits: 'unlabeled' | 'train' | 'test'
+      cifar10 splits: 'train' | 'test'
+    """
+    if dataset == "stl10":
+        return datasets.STL10(data_dir, split=split, download=download, transform=transform)
+    if dataset == "cifar10":
+        if split not in ("train", "test"):
+            raise ValueError(f"cifar10 has no split {split!r} (use 'train' or 'test')")
+        return datasets.CIFAR10(data_dir, train=(split == "train"),
+                                download=download, transform=transform)
+    raise ValueError(f"Unknown dataset: {dataset!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -238,3 +259,26 @@ def run_probe(
         accs.append((preds == y_te).float().mean().item())
 
     return float(np.mean(accs))
+
+
+def probe_teacher_student(teacher, student, train_loader, test_loader,
+                          w_bits, a_bits, device, use_amp,
+                          weight_granularity: str = "per_tensor"):
+    """Probe teacher and student at one (w_bits, a_bits) config.
+
+    Extracts features for both models on the probe-train and probe-test loaders,
+    carves a held-out val split out of probe-train (same split for both models),
+    fits a linear probe for each, and returns (teacher_acc, student_acc, feat_sim)
+    where feat_sim is the mean cosine similarity between student and teacher train
+    features. Shared by run_qit.py and run_cross_dataset_eval.py.
+    """
+    t_tr, l_tr = extract_features(teacher, train_loader, device, use_amp, w_bits, a_bits, weight_granularity)
+    s_tr, _    = extract_features(student, train_loader, device, use_amp, w_bits, a_bits, weight_granularity)
+    t_te, l_te = extract_features(teacher, test_loader,  device, use_amp, w_bits, a_bits, weight_granularity)
+    s_te, _    = extract_features(student, test_loader,  device, use_amp, w_bits, a_bits, weight_granularity)
+
+    tr_idx, va_idx = split_train_val(len(l_tr))
+    feat_sim    = float(F.cosine_similarity(torch.tensor(s_tr), torch.tensor(t_tr)).mean())
+    teacher_acc = run_probe(t_tr[tr_idx], l_tr[tr_idx], t_tr[va_idx], l_tr[va_idx], t_te, l_te, device)
+    student_acc = run_probe(s_tr[tr_idx], l_tr[tr_idx], s_tr[va_idx], l_tr[va_idx], s_te, l_te, device)
+    return teacher_acc, student_acc, feat_sim

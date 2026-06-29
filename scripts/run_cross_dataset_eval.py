@@ -21,29 +21,21 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from models.eval_utils import (
-    _pbar, QUANT_CONFIGS, _TRANSFORM, build_backbone, load_backbone,
-    extract_features, run_probe, split_train_val,
+    _pbar, QUANT_CONFIGS, build_backbone, load_backbone,
+    load_vision_dataset, probe_teacher_student,
 )
 
 
 def load_target_dataset(dataset: str, data_dir: str):
     """Returns (probe_train_ds, probe_test_ds) with labels, for linear-probe eval."""
-    if dataset == "stl10":
-        probe_train_ds = datasets.STL10(data_dir, split="train", download=True, transform=_TRANSFORM)
-        probe_test_ds  = datasets.STL10(data_dir, split="test",  download=True, transform=_TRANSFORM)
-    elif dataset == "cifar10":
-        probe_train_ds = datasets.CIFAR10(data_dir, train=True,  download=True, transform=_TRANSFORM)
-        probe_test_ds  = datasets.CIFAR10(data_dir, train=False, download=True, transform=_TRANSFORM)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset!r}")
+    probe_train_ds = load_vision_dataset(dataset, "train", data_dir)
+    probe_test_ds  = load_vision_dataset(dataset, "test",  data_dir)
     return probe_train_ds, probe_test_ds
 
 
@@ -156,19 +148,10 @@ def main():
     results = {}
     for qk, wb, ab in active_configs:
         print(f"\n  [{qk}] extracting features...")
-        t_tr, l_tr = extract_features(teacher, probe_train_loader, device, use_amp, wb, ab, args.weight_granularity)
-        s_tr, _    = extract_features(student, probe_train_loader, device, use_amp, wb, ab, args.weight_granularity)
-        t_te, l_te = extract_features(teacher, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
-        s_te, _    = extract_features(student, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
-
-        # Hold out a slice of the probe-train set for early stopping / best-
-        # checkpoint selection (same split for teacher and student features).
-        tr_idx, va_idx = split_train_val(len(l_tr))
-        feat_sim    = float(F.cosine_similarity(
-            torch.tensor(s_tr), torch.tensor(t_tr)).mean())
-        teacher_acc = run_probe(t_tr[tr_idx], l_tr[tr_idx], t_tr[va_idx], l_tr[va_idx], t_te, l_te, device)
-        student_acc = run_probe(s_tr[tr_idx], l_tr[tr_idx], s_tr[va_idx], l_tr[va_idx], s_te, l_te, device)
-        delta       = student_acc - teacher_acc
+        teacher_acc, student_acc, feat_sim = probe_teacher_student(
+            teacher, student, probe_train_loader, probe_test_loader,
+            wb, ab, device, use_amp, args.weight_granularity)
+        delta = student_acc - teacher_acc
 
         print(f"  {qk:<8}  {teacher_acc:>12.4f}  {student_acc:>12.4f}  "
               f"  {delta:>+8.4f}  {feat_sim:>10.4f}")

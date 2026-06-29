@@ -29,16 +29,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from models.quantization import quantized_forward, BitWidthSampler
 from models.eval_utils import (
-    _pbar, QUANT_CONFIGS, _TRANSFORM, build_backbone,
-    extract_features, run_probe, split_train_val,
+    _pbar, QUANT_CONFIGS, build_backbone,
+    load_vision_dataset, probe_teacher_student,
 )
+from models.cka import compute_layer_cka
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -54,102 +54,6 @@ class _IndexedSubset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         x, y = self.subset[idx]
         return x, y, self.subset.indices[idx]
-
-
-# ---------------------------------------------------------------------------
-# Layer-wise CKA
-# ---------------------------------------------------------------------------
-
-# Verified layer names for each backbone (named_modules paths).
-# Chosen to give ~4 evenly-spaced checkpoints through the network depth.
-_CKA_LAYERS: dict = {
-    "resnet18": [
-        "layer1", "layer2", "layer3", "layer4",
-    ],
-    "efficientnet_b0": [
-        "features.2", "features.4", "features.6", "features.8",
-    ],
-    "mobilenet_v3_small": [
-        "features.3", "features.6", "features.9", "features.12",
-    ],
-    "vit_b_16": [
-        "encoder.layers.encoder_layer_2",
-        "encoder.layers.encoder_layer_5",
-        "encoder.layers.encoder_layer_8",
-        "encoder.layers.encoder_layer_11",
-    ],
-    "swin_t": [
-        "features.1", "features.3", "features.5", "features.7",
-    ],
-}
-
-
-def _pool_to_2d(t: torch.Tensor) -> torch.Tensor:
-    """Collapse spatial / sequence dims to (N, D) so CKA can operate on a matrix."""
-    if t.dim() == 4:    # (N, C, H, W) — CNN feature map → global avg pool
-        return t.flatten(2).mean(2)
-    if t.dim() == 3:    # (N, seq, D) — transformer sequence → mean over tokens
-        return t.mean(1)
-    return t            # already (N, D)
-
-
-def _linear_cka(X: torch.Tensor, Y: torch.Tensor) -> float:
-    """Linear CKA between two (N, D) representation matrices.
-
-    Invariant to orthogonal transforms and isotropic scaling — measures how
-    similarly the two models organise the same inputs, not just whether their
-    feature vectors point in the same direction.
-    """
-    X = X - X.mean(0)
-    Y = Y - Y.mean(0)
-    num   = torch.norm(Y.T @ X, "fro").item() ** 2
-    denom = torch.norm(X.T @ X, "fro").item() * torch.norm(Y.T @ Y, "fro").item()
-    return num / (denom + 1e-8)
-
-
-@torch.no_grad()
-def compute_layer_cka(teacher: nn.Module, student: nn.Module,
-                      probe_x: torch.Tensor, backbone: str) -> dict:
-    """Compute linear CKA between student and teacher at each named layer.
-
-    Both models are run in eval / no-grad mode on a single probe batch.
-    Spatial and sequence dimensions are collapsed via global average before CKA
-    so the metric is architecture-agnostic.
-
-    Returns an empty dict if the backbone is not in _CKA_LAYERS.
-    """
-    layer_names = _CKA_LAYERS.get(backbone, [])
-    if not layer_names:
-        return {}
-
-    t_acts: dict = {}
-    s_acts: dict = {}
-    hooks  = []
-
-    def _make_hook(store: dict, key: str):
-        def _hook(mod, inp, out):
-            store[key] = _pool_to_2d(out.detach().float().cpu())
-        return _hook
-
-    for model, store in [(teacher, t_acts), (student, s_acts)]:
-        model.eval()
-        for ln in layer_names:
-            mod = model
-            for part in ln.split("."):
-                mod = getattr(mod, part)
-            hooks.append(mod.register_forward_hook(_make_hook(store, ln)))
-
-    teacher(probe_x)
-    student(probe_x)
-
-    for h in hooks:
-        h.remove()
-
-    return {
-        ln: round(_linear_cka(s_acts[ln], t_acts[ln]), 4)
-        for ln in layer_names
-        if ln in s_acts and ln in t_acts
-    }
 
 
 def _freeze_bn(model: nn.Module) -> int:
@@ -399,20 +303,15 @@ def main():
     if args.dataset == "stl10":
         print("Loading STL-10...")
         # Unlabeled split (100k) for QIT training — no labels needed
-        qit_full       = datasets.STL10(data_dir, split="unlabeled", download=True,
-                                        transform=_TRANSFORM)
+        qit_full       = load_vision_dataset("stl10", "unlabeled", data_dir)
         # Labeled splits for probe evaluation
-        probe_train_ds = datasets.STL10(data_dir, split="train", download=True,
-                                        transform=_TRANSFORM)
-        probe_test_ds  = datasets.STL10(data_dir, split="test",  download=True,
-                                        transform=_TRANSFORM)
+        probe_train_ds = load_vision_dataset("stl10", "train", data_dir)
+        probe_test_ds  = load_vision_dataset("stl10", "test",  data_dir)
         full_train = qit_full   # teacher feature cache indexes into this
     else:
         print("Loading CIFAR-10...")
-        full_train    = datasets.CIFAR10(data_dir, train=True,  download=True,
-                                         transform=_TRANSFORM)
-        probe_test_ds = datasets.CIFAR10(data_dir, train=False, download=True,
-                                         transform=_TRANSFORM)
+        full_train    = load_vision_dataset("cifar10", "train", data_dir)
+        probe_test_ds = load_vision_dataset("cifar10", "test",  data_dir)
 
     # QIT train/val split within the QIT dataset
     rng      = np.random.default_rng(42)
@@ -624,19 +523,10 @@ def main():
 
     for qk, wb, ab in QUANT_CONFIGS:
         print(f"\n  [{qk}] extracting features...")
-        t_tr, l_tr = extract_features(teacher, probe_train_loader, device, use_amp, wb, ab, args.weight_granularity)
-        s_tr, _    = extract_features(student, probe_train_loader, device, use_amp, wb, ab, args.weight_granularity)
-        t_te, l_te = extract_features(teacher, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
-        s_te, _    = extract_features(student, probe_test_loader,  device, use_amp, wb, ab, args.weight_granularity)
-
-        # Hold out a slice of the probe-train set for early stopping / best-
-        # checkpoint selection (same split for teacher and student features).
-        tr_idx, va_idx = split_train_val(len(l_tr))
-        feat_sim    = float(F.cosine_similarity(
-            torch.tensor(s_tr), torch.tensor(t_tr)).mean())
-        teacher_acc = run_probe(t_tr[tr_idx], l_tr[tr_idx], t_tr[va_idx], l_tr[va_idx], t_te, l_te, device)
-        student_acc = run_probe(s_tr[tr_idx], l_tr[tr_idx], s_tr[va_idx], l_tr[va_idx], s_te, l_te, device)
-        delta       = student_acc - teacher_acc
+        teacher_acc, student_acc, feat_sim = probe_teacher_student(
+            teacher, student, probe_train_loader, probe_test_loader,
+            wb, ab, device, use_amp, args.weight_granularity)
+        delta = student_acc - teacher_acc
 
         print(f"  {qk:<8}  {teacher_acc:>12.4f}  {student_acc:>12.4f}  "
               f"  {delta:>+8.4f}  {feat_sim:>10.4f}")

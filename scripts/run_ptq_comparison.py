@@ -32,14 +32,13 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from models.quantization import calibrate_activations
 from models.eval_utils import (
-    _pbar, QUANT_CONFIGS, _TRANSFORM, load_backbone,
+    _pbar, QUANT_CONFIGS, load_backbone, load_vision_dataset,
     extract_features, run_probe, split_train_val,
 )
 
@@ -51,12 +50,12 @@ from models.eval_utils import (
 def load_datasets(dataset: str, data_dir: str):
     """Returns (calib_ds, probe_train_ds, probe_test_ds)."""
     if dataset == "stl10":
-        calib_ds       = datasets.STL10(data_dir, split="unlabeled", download=True, transform=_TRANSFORM)
-        probe_train_ds = datasets.STL10(data_dir, split="train",     download=True, transform=_TRANSFORM)
-        probe_test_ds  = datasets.STL10(data_dir, split="test",      download=True, transform=_TRANSFORM)
+        calib_ds       = load_vision_dataset("stl10", "unlabeled", data_dir)
+        probe_train_ds = load_vision_dataset("stl10", "train",     data_dir)
+        probe_test_ds  = load_vision_dataset("stl10", "test",      data_dir)
     elif dataset == "cifar10":
-        train_ds       = datasets.CIFAR10(data_dir, train=True,  download=True, transform=_TRANSFORM)
-        probe_test_ds  = datasets.CIFAR10(data_dir, train=False, download=True, transform=_TRANSFORM)
+        train_ds       = load_vision_dataset("cifar10", "train", data_dir)
+        probe_test_ds  = load_vision_dataset("cifar10", "test",  data_dir)
         # Use first 5 000 images for calibration, rest for probe training
         calib_ds       = Subset(train_ds, list(range(5_000)))
         probe_train_ds = Subset(train_ds, list(range(5_000, len(train_ds))))

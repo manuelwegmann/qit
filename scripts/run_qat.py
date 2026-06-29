@@ -38,14 +38,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from models.quantization import quantized_forward
 from models.eval_utils import (
-    _pbar, _TRANSFORM, FEATURE_DIMS, load_backbone,
+    _pbar, FEATURE_DIMS, load_backbone, load_vision_dataset,
 )
 
 
@@ -58,14 +57,8 @@ N_CLASSES = {"cifar10": 10, "stl10": 10}
 
 def load_datasets(dataset: str, data_dir: str, val_frac: float = 0.1):
     """Returns (train_ds, val_ds, test_ds) with labeled splits only."""
-    if dataset == "cifar10":
-        full_train = datasets.CIFAR10(data_dir, train=True,  download=True, transform=_TRANSFORM)
-        test_ds    = datasets.CIFAR10(data_dir, train=False, download=True, transform=_TRANSFORM)
-    elif dataset == "stl10":
-        full_train = datasets.STL10(data_dir, split="train", download=True, transform=_TRANSFORM)
-        test_ds    = datasets.STL10(data_dir, split="test",  download=True, transform=_TRANSFORM)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset!r}")
+    full_train = load_vision_dataset(dataset, "train", data_dir)
+    test_ds    = load_vision_dataset(dataset, "test",  data_dir)
 
     n      = len(full_train)
     n_val  = max(1, int(n * val_frac))
