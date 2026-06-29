@@ -1,6 +1,6 @@
 # QIT — Quantization-Invariant Training
 
-Fine-tunes a pretrained model to produce stable representations across arbitrary quantization bit-widths, enabling deployment at W2–W8 / A4–A8 without retraining from scratch.
+Fine-tunes a pretrained model to produce stable representations across arbitrary quantization bit-widths, enabling deployment at W2–W8 / A4–A8 without retraining from scratch. Implemented for vision backbones (`run_qit.py`), text encoders (`run_qit_text.py`), and the Merlin CT foundation model (`run_qit_merlin.py`).
 
 ## Idea
 
@@ -40,6 +40,34 @@ BACKBONE=resnet18 N_TRAIN=500 EPOCHS=3 PATIENCE=0 DATASET=cifar10 sbatch scripts
 ```
 
 Results are written to `runs/qit_<dataset>_<backbone>/results.json`.
+
+## Merlin (CT)
+
+The Merlin track applies QIT to the Merlin foundation model (I3ResNet-152) on CT
+volumes, evaluated by linear-probe AUROC over 30 disease conditions. It expects
+the `quantized_ft` and `CT-CLIP` repositories as siblings of this one.
+
+Unlike the vision/text scripts, training and evaluation are **separate**:
+`run_qit_merlin.py` only produces checkpoints, and probing is done afterwards on
+cached, statically-calibrated features.
+
+```bash
+# 1. train (add --full_data to train on combined train+val with no early stopping)
+sbatch scripts/run_slurm_qit_merlin.sbatch
+
+# 2. cache features for all bit-width configs (student + teacher)
+sbatch scripts/run_slurm_cache_student_features.sbatch
+sbatch scripts/run_slurm_cache_teacher_features.sbatch
+
+# 3. per-condition linear-probe AUROC (early-stopped per condition), then plot
+FEAT_DIR=runs/qit_merlin_fulldata/features sbatch scripts/run_slurm_probe_merlin.sbatch
+python scripts/plot_probe_merlin.py --student .../probe_results/results.json \
+    --teacher .../probe_results/results.json --out_dir plots/merlin
+```
+
+Other evaluation helpers apply across all three settings: `run_qat*.py`
+(quantization-aware training), `run_ptq_comparison*.py` (dynamic vs. calibrated
+PTQ), and `compute_bitops.py` (theoretical compute savings).
 
 Key arguments:
 
